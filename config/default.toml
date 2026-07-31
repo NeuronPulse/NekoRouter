@@ -1,0 +1,68 @@
+[bot]
+name = "NekoRouter"
+qq_id = 123456789
+
+[websocket]
+url = "ws://127.0.0.1:3001"
+token = ""
+reconnect_interval_sec = 5
+
+[sqlite]
+path = "data/neko.db"
+batch_size = 50
+flush_interval_ms = 5000
+
+[qdrant]
+url = "http://127.0.0.1:6333"
+collection = "long_term_memory"
+vector_dim = 1024
+
+[embedding]
+base_url = "https://api.openai.com/v1"
+model = "text-embedding-3-small"
+api_key = "${NEKO_EMBEDDING_API_KEY}"
+
+[neo4j]
+uri = "bolt://127.0.0.1:7687"
+user = "neo4j"
+password = "${NEKO_NEO4J_PASSWORD}"
+
+[llm]
+gate = "deepseek"
+council = "grok"
+detective = "grok"
+solidify = "grok"
+
+[llm.providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+api_key = "${NEKO_DEEPSEEK_API_KEY}"
+temperature = 0.7
+max_tokens = 32
+response_format = "text"
+
+[llm.providers.grok]
+base_url = "https://api.x.ai/v1"
+model = "grok-3"
+api_key = "${NEKO_GROK_API_KEY}"
+temperature = 0.9
+max_tokens = 512
+response_format = "json"
+
+[llm.providers.gemini]
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+model = "gemini-2.5-ultra"
+api_key = "${NEKO_GEMINI_API_KEY}"
+temperature = 0.9
+max_tokens = 512
+response_format = "json"
+
+[personality]
+max_cozy_words = 10
+max_message_length = 800
+energy_decay_per_min = 0.05
+favor_decay_per_min = 0.02
+
+[solidify]
+cron = "0 0 3 * * *"
+timezone = "Asia/Shanghai"

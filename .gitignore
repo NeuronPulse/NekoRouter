@@ -1,0 +1,7 @@
+/target
+/data
+config/local.toml
+config/production.toml
+.env
+*.db
+.trae/

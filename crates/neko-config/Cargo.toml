@@ -1,0 +1,17 @@
+[package]
+name = "neko-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Configuration and secrets management for NekoRouter"
+
+[dependencies]
+config = { workspace = true }
+dotenvy = { workspace = true }
+neko-core = { workspace = true }
+serde = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }

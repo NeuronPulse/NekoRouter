@@ -1,0 +1,24 @@
+[package]
+name = "neko-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SQLite, Qdrant and Neo4j storage implementations for NekoRouter"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+neko-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"

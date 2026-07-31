@@ -1,0 +1,24 @@
+[package]
+name = "neko-sensory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Layer 1: sensory ingestion, WebSocket ingress, buffering and affective state"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+napcat-link = { workspace = true }
+neko-config = { workspace = true }
+neko-core = { workspace = true }
+neko-memory = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

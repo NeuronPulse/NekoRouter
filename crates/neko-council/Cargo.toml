@@ -1,0 +1,22 @@
+[package]
+name = "neko-council"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Layer 3: Mind Council for NekoRouter"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+neko-config = { workspace = true }
+neko-core = { workspace = true }
+neko-llm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

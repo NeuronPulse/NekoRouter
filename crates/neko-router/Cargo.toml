@@ -1,0 +1,40 @@
+[package]
+name = "neko-router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Binary crate that orchestrates all NekoRouter layers"
+
+[[bin]]
+name = "neko-router"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { workspace = true }
+chrono-tz = "0.10"
+neko-config = { workspace = true }
+secrecy = { workspace = true }
+neko-core = { workspace = true }
+neko-council = { workspace = true }
+neko-detective = { workspace = true }
+neko-gate = { workspace = true }
+neko-llm = { workspace = true }
+neko-memory = { workspace = true }
+neko-sensory = { workspace = true }
+neko-solidify = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-cron-scheduler = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio-test = "0.4"
+uuid = { workspace = true }

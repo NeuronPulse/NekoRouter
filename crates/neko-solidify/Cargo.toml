@@ -1,0 +1,24 @@
+[package]
+name = "neko-solidify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Layer 5: Late-night solidification center for NekoRouter"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+neko-config = { workspace = true }
+neko-core = { workspace = true }
+neko-llm = { workspace = true }
+neko-memory = { workspace = true }
+neo4rs = { version = "0.8.0", features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-cron-scheduler = { workspace = true }
+tracing = { workspace = true }

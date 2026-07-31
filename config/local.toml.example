@@ -1,0 +1,32 @@
+# Copy this file to local.toml and fill in your secrets.
+# local.toml is gitignored by default.
+
+[websocket]
+url = "ws://127.0.0.1:3001"
+token = "your_napcat_token"
+
+# Local embedding server (see scripts/local_embedding_server.py).
+# The vector_dim here must match the output dimension of the chosen model.
+[embedding]
+base_url = "http://127.0.0.1:8000/v1"
+model = "local"
+api_key = "local"
+
+[qdrant]
+url = "http://127.0.0.1:6333"
+vector_dim = 512
+
+[neo4j]
+uri = "bolt://127.0.0.1:7687"
+user = "neo4j"
+password = "password"
+
+# Gate / Council providers. Use your own keys for real LLM calls.
+[llm.providers.deepseek]
+api_key = "sk-..."
+
+[llm.providers.grok]
+api_key = "xai-..."
+
+[llm.providers.gemini]
+api_key = "..."

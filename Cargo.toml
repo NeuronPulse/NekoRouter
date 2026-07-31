@@ -1,0 +1,67 @@
+[workspace]
+members = [
+    "crates/neko-core",
+    "crates/neko-config",
+    "crates/neko-memory",
+    "crates/neko-llm",
+    "crates/neko-sensory",
+    "crates/neko-gate",
+    "crates/neko-council",
+    "crates/neko-detective",
+    "crates/neko-solidify",
+    "crates/neko-router",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["NekoRouter Contributors"]
+repository = "https://github.com/NeuronPulse/NekoRouter"
+
+[workspace.dependencies]
+# Shared
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.40", features = ["full"] }
+tokio-cron-scheduler = "0.13"
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
+
+# Config
+config = "0.14"
+dotenvy = "0.15"
+secrecy = { version = "0.8", features = ["serde"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono", "uuid"] }
+
+# HTTP / LLM
+reqwest = { version = "0.12", features = ["json"] }
+
+# QQ / OneBot SDK
+napcat-link = "0.1.0-alpha.2"
+
+# Concurrency / State
+dashmap = "6.1"
+
+# Testing
+wiremock = "0.6"
+
+# Internal crates
+neko-core = { path = "crates/neko-core" }
+neko-config = { path = "crates/neko-config" }
+neko-memory = { path = "crates/neko-memory" }
+neko-llm = { path = "crates/neko-llm" }
+neko-sensory = { path = "crates/neko-sensory" }
+neko-gate = { path = "crates/neko-gate" }
+neko-council = { path = "crates/neko-council" }
+neko-detective = { path = "crates/neko-detective" }
+neko-solidify = { path = "crates/neko-solidify" }

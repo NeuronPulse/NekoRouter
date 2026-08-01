@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use neko_core::{AffectiveState, ChatMessage, GroupId, HistoryStore, NekoError, UserId};
+use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Pool, QueryBuilder, Sqlite, SqlitePool};
 use std::path::Path;
+use std::str::FromStr;
 use tracing::{debug, info};
 
 /// SQLite-backed implementation of [`HistoryStore`].
@@ -22,7 +24,12 @@ impl SqliteStore {
         }
 
         let url = format!("sqlite:{}", path.display());
-        let pool = SqlitePool::connect(&url)
+        // `sqlite:` URLs parse to create_if_missing=false, so a fresh DB file
+        // would never be created; opt in explicitly.
+        let options = SqliteConnectOptions::from_str(&url)
+            .map_err(|e| NekoError::database(format!("invalid sqlite url: {e}")))?
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options)
             .await
             .map_err(|e| NekoError::database(format!("cannot connect to sqlite: {e}")))?;
 
@@ -225,6 +232,152 @@ impl SqliteStore {
             .map_err(|e| NekoError::database(format!("count events failed: {e}")))?;
         Ok(count)
     }
+
+    /// Number of persisted messages (used for observability).
+    pub async fn count_messages(&self) -> Result<i64, NekoError> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| NekoError::database(format!("count messages failed: {e}")))?;
+        Ok(count)
+    }
+
+    /// Mark messages as flushed to the store (sets `processed_at`).
+    pub async fn mark_processed(&self, ids: &[neko_core::MessageId]) -> Result<(), NekoError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().timestamp_millis();
+        for id in ids {
+            sqlx::query("UPDATE messages SET processed_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(id.to_string())
+                .execute(&self.pool)
+                .await
+                .map_err(|e| NekoError::database(format!("mark processed failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Number of persisted affective snapshots (used for observability).
+    pub async fn count_snapshots(&self) -> Result<i64, NekoError> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM affective_snapshots")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| NekoError::database(format!("count snapshots failed: {e}")))?;
+        Ok(count)
+    }
+
+    /// Most recent messages, newest first.
+    pub async fn recent_messages(&self, limit: usize) -> Result<Vec<StoredMessage>, NekoError> {
+        let rows: Vec<StoredMessageRow> = sqlx::query_as(
+            "SELECT id, group_id, sender_id, sender_nick, content, reply_to, created_at \
+             FROM messages ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| NekoError::database(format!("query recent messages failed: {e}")))?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(StoredMessage {
+                    id: r.id,
+                    group_id: r.group_id,
+                    sender_id: r.sender_id,
+                    sender_nick: r.sender_nick,
+                    content: r.content,
+                    reply_to: r.reply_to,
+                    created_at: timestamp_to_utc(r.created_at)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Most recent replies, newest first.
+    pub async fn recent_replies(&self, limit: usize) -> Result<Vec<StoredReply>, NekoError> {
+        let rows: Vec<StoredReplyRow> = sqlx::query_as(
+            "SELECT id, message_id, layer, content, sent_at \
+             FROM replies ORDER BY sent_at DESC LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| NekoError::database(format!("query recent replies failed: {e}")))?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(StoredReply {
+                    id: r.id,
+                    message_id: r.message_id,
+                    layer: r.layer,
+                    content: r.content,
+                    sent_at: timestamp_to_utc(r.sent_at)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Most recent internal events, newest first.
+    pub async fn recent_events(&self, limit: usize) -> Result<Vec<StoredEvent>, NekoError> {
+        let rows: Vec<StoredEventRow> = sqlx::query_as(
+            "SELECT id, kind, payload, created_at FROM events ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| NekoError::database(format!("query recent events failed: {e}")))?;
+
+        rows.into_iter()
+            .map(|r| {
+                let payload = serde_json::from_str(&r.payload)
+                    .unwrap_or_else(|_| serde_json::Value::String(r.payload.clone()));
+                Ok(StoredEvent {
+                    id: r.id,
+                    kind: r.kind,
+                    payload,
+                    created_at: timestamp_to_utc(r.created_at)?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A single message as stored in the `messages` table (observability).
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    pub id: String,
+    pub group_id: GroupId,
+    pub sender_id: UserId,
+    pub sender_nick: Option<String>,
+    pub content: String,
+    pub reply_to: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A single reply as stored in the `replies` table (observability).
+#[derive(Debug, Clone)]
+pub struct StoredReply {
+    pub id: String,
+    pub message_id: String,
+    pub layer: String,
+    pub content: String,
+    pub sent_at: DateTime<Utc>,
+}
+
+/// A single internal event as stored in the `events` table (observability).
+#[derive(Debug, Clone)]
+pub struct StoredEvent {
+    pub id: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+fn timestamp_to_utc(millis: i64) -> Result<DateTime<Utc>, NekoError> {
+    Utc.timestamp_millis_opt(millis)
+        .single()
+        .ok_or_else(|| NekoError::database("invalid stored timestamp"))
 }
 
 #[async_trait]
@@ -287,6 +440,10 @@ impl HistoryStore for SqliteStore {
         states: &[(GroupId, UserId, AffectiveState)],
     ) -> Result<(), NekoError> {
         self.save_affective_states(states).await
+    }
+
+    async fn mark_processed(&self, ids: &[neko_core::MessageId]) -> Result<(), NekoError> {
+        self.mark_processed(ids).await
     }
 }
 
@@ -420,4 +577,32 @@ mod tests {
             .unwrap();
         assert_eq!(s.energy, 0.9);
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct StoredMessageRow {
+    id: String,
+    group_id: String,
+    sender_id: String,
+    sender_nick: Option<String>,
+    content: String,
+    reply_to: Option<String>,
+    created_at: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct StoredReplyRow {
+    id: String,
+    message_id: String,
+    layer: String,
+    content: String,
+    sent_at: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct StoredEventRow {
+    id: String,
+    kind: String,
+    payload: String,
+    created_at: i64,
 }

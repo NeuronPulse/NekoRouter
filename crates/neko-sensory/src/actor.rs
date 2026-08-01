@@ -194,7 +194,9 @@ impl<HS: HistoryStore> SensoryActor<HS> {
 
         if !batch.is_empty() {
             debug!("flushing {} messages to history store", batch.len());
+            let ids: Vec<MessageId> = batch.iter().map(|m| m.id).collect();
             self.history_store.append_batch(&batch).await?;
+            self.history_store.mark_processed(&ids).await?;
         }
 
         self.persist_states().await

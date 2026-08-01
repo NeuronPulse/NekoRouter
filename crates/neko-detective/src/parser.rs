@@ -84,6 +84,9 @@ pub fn parse_detective_report(raw: &str) -> Result<DetectiveReport, NekoError> {
             .collect(),
         recommended_tone: parse_tone(&parsed.recommended_tone),
         confidence: parsed.confidence.clamp(0.0, 1.0),
+        // message_id/group_id are filled in by the detective actor from the
+        // request; the LLM never supplies them.
+        ..Default::default()
     })
 }
 

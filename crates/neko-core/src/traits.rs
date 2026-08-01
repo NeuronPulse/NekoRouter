@@ -1,6 +1,6 @@
 use crate::types::{
     AffectiveState, ChatMessage, GraphUpdate, GroupId, LlmRequest, LlmResponse, MemoryRecord,
-    ReplyOut, UserId,
+    MessageId, ReplyOut, UserId,
 };
 use crate::NekoError;
 use async_trait::async_trait;
@@ -51,6 +51,11 @@ pub trait HistoryStore: Send + Sync {
     ) -> Result<(), NekoError> {
         Ok(())
     }
+
+    /// Mark messages as processed (flushed to the store). Defaults to a no-op.
+    async fn mark_processed(&self, _ids: &[MessageId]) -> Result<(), NekoError> {
+        Ok(())
+    }
 }
 
 /// Vector memory store (Qdrant or similar).
@@ -70,6 +75,13 @@ pub trait VectorStore: Send + Sync {
 #[async_trait]
 pub trait GraphStore: Send + Sync {
     async fn apply_updates(&self, updates: &[GraphUpdate]) -> Result<(), NekoError>;
+
+    /// Produce a short human-readable summary of the strongest stored
+    /// relationships. Used by solidify to refresh the council's long-term
+    /// memory. Defaults to an empty summary.
+    async fn relationship_summary(&self, _limit: usize) -> Result<String, NekoError> {
+        Ok(String::new())
+    }
 }
 
 /// Ingress adapter that feeds incoming events into the router.

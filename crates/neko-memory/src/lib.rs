@@ -1,3 +1,3 @@
 pub mod sqlite;
 
-pub use sqlite::SqliteStore;
+pub use sqlite::{SqliteStore, StoredEvent, StoredMessage, StoredReply};

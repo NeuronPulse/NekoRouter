@@ -58,26 +58,29 @@
   }
   ```
 
-- 首席路由官解析输出，决定直接回复或启动侦探。
+- 首席路由官解析输出，决定直接回复或启动侦探；侦探返回报告后由议会合成最终回复（反馈回路），议会始终是唯一回复出口。
+- 侦探报告有超时保护：交给侦探的升级请求按 `council.detective_timeout`（默认 300s）登记，超时未返回报告会被周期性清扫，防止 `pending_detective` 无限增长（晚到的报告会被忽略）。
+- 接收 `Event::DailyContext`（固化中心产出的长期关系记忆摘要），注入议会 prompt 作为背景信息，使回复受长期关系影响。
 
 ### Layer 4 侦探智能体（`neko-detective`）
 
 职责：
 
 - 接收 `Event::DetectiveRequest`。
-- 并行查询 SQLite 历史与 Qdrant 向量记忆（MVP 使用 `StubVectorStore`）。
+- 并行查询 SQLite 历史与 Qdrant 向量记忆（`qdrant.url` 为空时回退 `InMemoryVectorStore`）。
 - 将检索结果组织成结构化 prompt，调用高级模型生成脱水 JSON 报告。
-- 报告通过 `Event::DetectiveReport` 发送给深夜固化中心，高置信度时直接生成 `ReplyOut`。
+- 报告通过 `Event::DetectiveReport` 同时发送给议会层（由议会合成最终回复）与深夜固化中心；侦探不再直接回复。
+- 报告中的 `historical_facts`（非空）会作为 `MemoryRecord`（tag `fact`、layer `detective`、speaker 指向目标用户）写回向量记忆，形成长期学习回路。
 
 ### Layer 5 深夜固化中心（`neko-solidify`）
 
 职责：
 
-- 按 `solidify.cron` 表达式触发（MVP 时区配置已读取但未生效，使用 UTC）。
+- 按 `solidify.cron` 表达式触发；`solidify.timezone`（IANA 名称，如 `Asia/Shanghai`）已生效，空值表示 UTC。
 - 缓冲白天产生的 `DetectiveReport`。
 - 触发时将报告 batch 转换为 LLM prompt，生成 `MERGE` Cypher 语句。
-- 通过 `GraphStore::apply_updates` 更新图数据库（MVP 使用 `StubGraphStore`）。
-- 根据图数据库状态刷新次日系统默认提示词，固化长期偏见（刷新逻辑预留）。
+- 通过 `GraphStore::apply_updates` 更新图数据库（`neo4j.uri` 为空时回退 `InMemoryGraphStore`）。
+- 固化后通过 `GraphStore::relationship_summary(20)` 读取按关系强度排序的摘要，作为 `Event::DailyContext` 推送给议会，刷新次日长期关系记忆。
 
 ## 事件流
 
@@ -92,30 +95,40 @@ NapCatIngress --(Event::IncomingMessage)--> SensoryActor
                                            /    |    \
                                           /     |     \
                                          v      v      v
-                                 GateDecision  ReplyOut  Escalation
-                                     |            |          |
-                                     v            v          v
-                                   SQLite      NapCatEgress  Council
-                                                                   |
-                                                    /---------------+---------------\
-                                                   v                               v
-                                              ReplyOut                       DetectiveRequest
-                                                   |                               |
-                                                   v                               v
-                                             NapCatEgress                       Detective
-                                                                                     |
-                                                                      /---------------+---------------\
-                                                                     v                               v
-                                                                ReplyOut                        DetectiveReport
-                                                                     |                               |
-                                                                     v                               v
-                                                               NapCatEgress                     Solidify
-                                                                                                     |
-                                                                                                     v
-                                                                                              GraphStore (Neo4j)
+                              GateDecision  ReplyOut  Escalation
+                                  |            |          |
+                                  v            v          v
+                                SQLite      NapCatEgress  Council
+                                                                |
+                                                 /---------------+---------------\
+                                                v                               v
+                                           ReplyOut                       DetectiveRequest
+                                                |                               |
+                                                v                               v
+                                          NapCatEgress                       Detective
+                                                                                  |
+                                                                                  v
+                                                                            DetectiveReport
+                                                                                  |
+                                                                   /--------------+---------------\
+                                                                  v                              v
+                                                            Council                    Solidify
+                                                                |                             |
+                                                                | (合成最终回复)                v
+                                                                v                        GraphStore (Neo4j)
+                                                           ReplyOut
+                                                                |
+                                                                v
+                                                          NapCatEgress
 ```
 
-`ReplyOut` 还会被路由回 `SensoryActor`，以便更新发送者的回复次数与好感度。
+`ReplyOut` 还会被路由回 `SensoryActor`，以便更新发送者的回复次数与好感度；同时经过回复冷却检查——同一群在 `personality.min_reply_interval_sec`（默认 3s）内的第二条回复会被丢弃（也不落库）。
+
+## 背压与可观测
+
+- `NapCatIngress` 用 `try_send` 而非阻塞 `send` 向下游投递：通道满时消息被丢弃并累加 `drop_count`（`ingress.drop_count()` 可读），避免把 NapCat 事件循环拖死；通道关闭时监听线程退出。
+- SQLite 消息按 batch 写入，`append_batch` 之后调用 `mark_processed` 标记已入库，避免重复处理。
+- 议会 `pending_detective_count()`、固化的关系摘要、`--observe` 输出等提供运行时状态可见性。
 
 ## 配置与秘密管理
 
@@ -138,3 +151,8 @@ export NEKO__WEBSOCKET__TOKEN="your_napcat_token"
 - 新增存储后端：实现 `HistoryStore` / `VectorStore` / `GraphStore` trait。
 - 新增 Gate 启发式：实现 `GateHeuristic` trait 并在 `heuristic_from_name` 注册。
 - 新增层：按相同的事件通道模式接入 `neko-router` 的编排逻辑。
+
+## 可观测性
+
+- `cargo run -p neko-router -- --observe [--limit N]`：只读打印 SQLite 中的消息/回复/事件数量及最近记录，用于检查机器人实际行为。
+- `--observe` 使用 `NekoConfig::load_observe()`（跳过 secret 校验），即使未配置 API key 也可运行。

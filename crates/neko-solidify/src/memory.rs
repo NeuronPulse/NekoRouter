@@ -83,6 +83,21 @@ impl GraphStore for InMemoryGraphStore {
 
         Ok(())
     }
+
+    async fn relationship_summary(&self, limit: usize) -> Result<String, NekoError> {
+        let rels = self.relationships.lock().unwrap();
+        let mut rows: Vec<((&str, &str, &str), f32)> = rels
+            .iter()
+            .map(|((from, to, kind), delta)| ((from.as_str(), to.as_str(), kind.as_str()), *delta))
+            .collect();
+        rows.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+        let lines: Vec<String> = rows
+            .iter()
+            .take(limit)
+            .map(|((from, to, kind), delta)| format!("{from} -[{kind}]-> {to} (delta {delta:+.2})"))
+            .collect();
+        Ok(lines.join("\n"))
+    }
 }
 
 #[cfg(test)]

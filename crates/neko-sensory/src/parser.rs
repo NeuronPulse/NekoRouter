@@ -57,6 +57,13 @@ pub fn parse_onebot11_group_message(payload: &Value) -> Option<ChatMessage> {
     // messages after a reconnect do not get inserted twice.
     let id = derive_message_id(&group_id.to_string(), &platform_message_id);
 
+    // A `reply` message segment references the platform id of the message
+    // this one answers; map it through the same derivation as `id`.
+    let reply_to = payload
+        .get("message")
+        .and_then(extract_reply_to)
+        .map(|platform_id| derive_message_id(&group_id.to_string(), &platform_id.to_string()));
+
     Some(ChatMessage {
         id,
         group_id: GroupId::from(group_id.to_string()),
@@ -64,9 +71,27 @@ pub fn parse_onebot11_group_message(payload: &Value) -> Option<ChatMessage> {
         nickname,
         content,
         timestamp,
-        reply_to: None,
+        reply_to,
         raw_payload: payload.clone(),
     })
+}
+
+/// Extract the platform message id referenced by a `reply` segment, if any.
+fn extract_reply_to(message: &Value) -> Option<u64> {
+    let Value::Array(segments) = message else {
+        return None;
+    };
+    for seg in segments {
+        if seg.get("type").and_then(|t| t.as_str()) == Some("reply") {
+            let id = seg.get("data")?.get("id")?;
+            return match id {
+                Value::Number(n) => n.as_u64(),
+                Value::String(s) => s.parse().ok(),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 fn extract_text(message: &Value) -> Option<String> {
@@ -196,5 +221,45 @@ mod tests {
         let a = parse_onebot11_group_message(&payload).unwrap();
         let b = parse_onebot11_group_message(&payload).unwrap();
         assert_eq!(a.id, b.id);
+    }
+
+    #[test]
+    fn parses_reply_segment_as_reply_to() {
+        let payload = json!({
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": 12345,
+            "user_id": 67890,
+            "message_id": 222,
+            "sender": {"nickname": "Bob"},
+            "message": [
+                {"type": "reply", "data": {"id": "111"}},
+                {"type": "text", "data": {"text": "哈哈哈"}}
+            ],
+            "time": 1700000000
+        });
+        let msg = parse_onebot11_group_message(&payload).unwrap();
+        assert_eq!(msg.content, "哈哈哈");
+        assert_eq!(msg.reply_to, Some(derive_message_id("12345", "111")));
+    }
+
+    #[test]
+    fn ignores_reply_segment_when_missing_id() {
+        let payload = json!({
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": 12345,
+            "user_id": 67890,
+            "message_id": 222,
+            "sender": {"nickname": "Bob"},
+            "message": [
+                {"type": "reply", "data": {}},
+                {"type": "text", "data": {"text": "hi"}}
+            ],
+            "time": 1700000000
+        });
+        let msg = parse_onebot11_group_message(&payload).unwrap();
+        assert_eq!(msg.content, "hi");
+        assert!(msg.reply_to.is_none());
     }
 }

@@ -16,11 +16,17 @@ use tokio::sync::{mpsc, watch};
 use tokio_cron_scheduler::{JobBuilder, JobScheduler};
 use tracing::{error, info, warn};
 
+mod observe;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    if std::env::args().any(|a| a == "--observe") {
+        return observe::run().await;
+    }
 
     let config = NekoConfig::load()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -135,6 +141,7 @@ impl Router {
             context_limit: 10,
             llm_temperature: council_provider.temperature,
             llm_max_tokens: council_provider.max_tokens.unwrap_or(512),
+            detective_timeout: std::time::Duration::from_secs(300),
         };
         let council_actor =
             neko_council::CouncilActor::new(council_config, council_llm, sqlite_arc.clone());
@@ -252,6 +259,9 @@ impl Router {
         // channel and persist observability records.
         let mut shutdown_for_dispatcher = self.shutdown.clone();
         let sqlite_for_dispatcher = self.sqlite.clone();
+        let reply_cooldown = neko_core::ReplyCooldown::new(std::time::Duration::from_secs(
+            self.config.personality.min_reply_interval_sec,
+        ));
         let dispatcher_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -270,6 +280,7 @@ impl Router {
                             &council_tx,
                             &detective_tx,
                             &solidify_tx,
+                            Some(&reply_cooldown),
                         ).await {
                             error!("dispatch error: {e}");
                         }

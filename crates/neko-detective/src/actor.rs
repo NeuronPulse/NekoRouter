@@ -2,7 +2,7 @@ use crate::{parser, prompt};
 use chrono::Utc;
 use neko_core::{
     DetectiveInput, DetectiveReport, Event, HistoryStore, LlmClient, LlmMessage, LlmRequest,
-    LlmRole, NekoError, ReplyOut, ResponseFormat, VectorStore,
+    LlmRole, NekoError, ResponseFormat, VectorStore,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -124,32 +124,50 @@ impl<C: LlmClient + 'static> DetectiveActor<C> {
             }
         };
 
-        out.send(Event::DetectiveReport(report.clone())).await.ok();
+        // Correlate the report with the message that triggered it so the
+        // council can turn it into a final reply and solidify can persist it.
+        let mut report = report;
+        report.message_id = req.message.id;
+        report.group_id = req.message.group_id.clone();
+        report.target_user = req.target_user.clone();
 
-        // If the report has high confidence, generate a reply directly.
-        if report.confidence >= 0.5 {
-            let tone_hint = match report.recommended_tone {
-                neko_core::Tone::Warm => "温柔地",
-                neko_core::Tone::Cold => "冷淡地",
-                neko_core::Tone::Playful => "俏皮地",
-                neko_core::Tone::Sarcastic => "带讽刺地",
-                neko_core::Tone::Cautious => "谨慎地",
-                neko_core::Tone::Neutral => "",
-            };
-            let reply = format!("{} {}", tone_hint, report.summary);
-            out.send(Event::ReplyOut(ReplyOut {
-                id: uuid::Uuid::new_v4(),
-                reply_to: req.message.id,
-                group_id: req.message.group_id,
-                target_user: req.target_user,
-                content: reply.trim().to_string(),
+        // Learn from the report: persist high-value facts back into vector
+        // memory so future investigations of this user recall them.
+        self.persist_facts(&report).await;
+
+        out.send(Event::DetectiveReport(report)).await.ok();
+        Ok(())
+    }
+
+    /// Write the report's historical facts into the vector store as memory
+    /// records, closing the learning loop (facts from one investigation are
+    /// retrieved by the next).
+    async fn persist_facts(&self, report: &DetectiveReport) {
+        let facts: Vec<neko_core::MemoryRecord> = report
+            .historical_facts
+            .iter()
+            .filter(|f| !f.text.trim().is_empty())
+            .map(|f| neko_core::MemoryRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                group_id: report.group_id.clone(),
+                speaker_id: report.target_user.clone(),
+                target_id: None,
+                text: f.text.clone(),
+                timestamp: f.occurred_at.unwrap_or_else(Utc::now),
+                relation_delta: None,
+                tags: vec!["fact".to_string(), "detective".to_string()],
                 layer: "detective".to_string(),
-            }))
-            .await
-            .map_err(|_| NekoError::transport("router channel closed"))?;
+            })
+            .collect();
+
+        if facts.is_empty() {
+            return;
         }
 
-        Ok(())
+        match self.vector_store.embed_and_upsert(&facts).await {
+            Ok(()) => debug!("persisted {} learned facts", facts.len()),
+            Err(e) => warn!("failed to persist learned facts: {e}"),
+        }
     }
 }
 
@@ -171,7 +189,7 @@ mod tests {
     use chrono::{DateTime, Utc};
     use neko_core::{
         AffectiveState, ChatMessage, DetectiveInput, Event, FinishReason, HistoryStore, LlmClient,
-        LlmRequest, LlmResponse, MemoryRecord, ReplyOut, TokenUsage, VectorStore,
+        LlmRequest, LlmResponse, MemoryRecord, TokenUsage, VectorStore,
     };
     use std::sync::Mutex;
     use uuid::Uuid;
@@ -263,7 +281,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn high_confidence_produces_report_and_reply() {
+    async fn report_is_correlated_and_no_direct_reply() {
         let (tx, rx) = mpsc::channel(16);
         let (out_tx, mut out_rx) = mpsc::channel(16);
 
@@ -287,26 +305,32 @@ mod tests {
             let _ = actor.run(rx, out_tx).await;
         });
 
+        let msg = make_message("你怎么看");
+        let message_id = msg.id;
         tx.send(Event::DetectiveRequest(DetectiveInput {
-            message: make_message("你怎么看"),
+            message: msg,
             state: AffectiveState::default(),
             target_user: "67890".to_string(),
         }))
         .await
         .unwrap();
 
+        // The report carries the triggering message id/group and no direct
+        // reply is emitted — the council decides the final reply.
         let event = out_rx.recv().await.expect("expected detective report");
-        assert!(matches!(event, Event::DetectiveReport(_)));
-
-        let event = out_rx.recv().await.expect("expected reply");
         match event {
-            Event::ReplyOut(ReplyOut { content, layer, .. }) => {
-                assert_eq!(layer, "detective");
-                assert!(content.contains("用户喜欢直接表达"));
-                assert!(content.starts_with("俏皮地"));
+            Event::DetectiveReport(report) => {
+                assert_eq!(report.message_id, message_id);
+                assert_eq!(report.group_id, "12345");
+                assert_eq!(report.target_user, "67890");
+                assert_eq!(report.confidence, 0.8);
             }
-            other => panic!("expected ReplyOut, got {other:?}"),
+            other => panic!("expected DetectiveReport, got {other:?}"),
         }
+
+        let timeout =
+            tokio::time::timeout(std::time::Duration::from_millis(200), out_rx.recv()).await;
+        assert!(timeout.is_err() || timeout.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -346,8 +370,65 @@ mod tests {
         assert!(matches!(event, Event::DetectiveReport(_)));
 
         let timeout =
-            tokio::time::timeout(std::time::Duration::from_millis(200), out_rx.recv()).await;
+            tokio::time::timeout(std::time::Duration::from_millis(300), out_rx.recv()).await;
         assert!(timeout.is_err() || timeout.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn report_facts_are_learned_into_vector_store() {
+        let (tx, rx) = mpsc::channel(16);
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+
+        let report = DetectiveReport {
+            target_user: "67890".to_string(),
+            summary: "确认过。".to_string(),
+            historical_facts: vec![
+                neko_core::Fact {
+                    text: "用户养了一只叫咪咪的猫。".to_string(),
+                    evidence: vec!["2026-08-01 消息".to_string()],
+                    occurred_at: None,
+                },
+                neko_core::Fact {
+                    text: "   ".to_string(),
+                    evidence: vec![],
+                    occurred_at: None,
+                },
+            ],
+            confidence: 0.9,
+            recommended_tone: neko_core::Tone::Warm,
+            ..Default::default()
+        };
+        let llm = MockLlm::new(vec![serde_json::to_string(&report).unwrap()]);
+
+        let vector_store = Arc::new(MockVectorStore::default());
+        let actor = DetectiveActor::new(
+            DetectiveConfig::default(),
+            llm,
+            Arc::new(MockHistory::default()),
+            vector_store.clone(),
+        );
+
+        tokio::spawn(async move {
+            let _ = actor.run(rx, out_tx).await;
+        });
+
+        tx.send(Event::DetectiveRequest(DetectiveInput {
+            message: make_message("你了解我吗？"),
+            state: AffectiveState::default(),
+            target_user: "67890".to_string(),
+        }))
+        .await
+        .unwrap();
+
+        let event = out_rx.recv().await.expect("expected detective report");
+        assert!(matches!(event, Event::DetectiveReport(_)));
+
+        // Only the non-blank fact is persisted, tagged as a learned fact.
+        let records = vector_store.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "用户养了一只叫咪咪的猫。");
+        assert_eq!(records[0].speaker_id, "67890");
+        assert!(records[0].tags.contains(&"fact".to_string()));
     }
 
     #[tokio::test]

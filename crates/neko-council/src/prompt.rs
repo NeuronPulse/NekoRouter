@@ -24,6 +24,12 @@ pub fn council_prompt(input: &CouncilInput, context: &[ChatMessage]) -> String {
             .join("\n")
     };
 
+    let daily_block = if input.daily_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!("当前长期关系记忆：\n{}\n\n", input.daily_context.trim())
+    };
+
     format!(
         "你是一座赛博猫娘心智议会中的首席路由官。现在需要决定如何回复 QQ 群里的这条消息。\n\
          \n\
@@ -32,6 +38,7 @@ pub fn council_prompt(input: &CouncilInput, context: &[ChatMessage]) -> String {
          精力值：{:.2}（越高越活跃）\n\
          好感度：{:.2}（越高越亲近）\n\
          \n\
+         {daily_block}\
          近期历史上下文：\n{}\n\
          \n\
          议会中有三个角色在辩论：\n\
@@ -80,6 +87,7 @@ mod tests {
                 ..Default::default()
             },
             context,
+            daily_context: String::new(),
         }
     }
 

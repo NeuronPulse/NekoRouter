@@ -49,7 +49,7 @@ impl<C: LlmClient + 'static> SolidifyActor<C> {
     pub async fn run(
         self,
         mut inbound: mpsc::Receiver<Event>,
-        _out: mpsc::Sender<Event>,
+        out: mpsc::Sender<Event>,
     ) -> Result<(), NekoError> {
         info!("solidify actor started");
 
@@ -67,8 +67,9 @@ impl<C: LlmClient + 'static> SolidifyActor<C> {
                 }
                 Event::SolidifyTick => {
                     let this = self.clone();
+                    let out = out.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = this.solidify().await {
+                        if let Err(e) = this.solidify(out).await {
                             warn!("solidify tick failed: {e}");
                         }
                     });
@@ -81,7 +82,7 @@ impl<C: LlmClient + 'static> SolidifyActor<C> {
         Ok(())
     }
 
-    async fn solidify(&self) -> Result<(), NekoError> {
+    async fn solidify(&self, out: mpsc::Sender<Event>) -> Result<(), NekoError> {
         let reports: Vec<DetectiveReport> = {
             let mut buf = self.buffer.lock().await;
             if buf.is_empty() {
@@ -123,6 +124,22 @@ impl<C: LlmClient + 'static> SolidifyActor<C> {
 
         self.graph_store.apply_updates(&updates).await?;
         info!("applied {} graph updates", updates.len());
+
+        // Refresh the council's long-term memory from the graph so nightly
+        // solidification actually influences the next day's replies.
+        let summary = self.graph_store.relationship_summary(20).await?;
+        let context = format!(
+            "以下为昨夜固化的长期关系记忆（按强度排序）：\n{}",
+            if summary.trim().is_empty() {
+                "（暂无关系记录）"
+            } else {
+                summary.trim()
+            }
+        );
+        out.send(Event::DailyContext(context))
+            .await
+            .map_err(|_| NekoError::transport("router channel closed"))?;
+
         Ok(())
     }
 }

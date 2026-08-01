@@ -11,6 +11,7 @@ description = "Layer 3: Mind Council for NekoRouter"
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
+dashmap = { workspace = true }
 neko-config = { workspace = true }
 neko-core = { workspace = true }
 neko-llm = { workspace = true }

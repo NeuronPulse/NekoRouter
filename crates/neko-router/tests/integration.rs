@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use neko_core::{
     AffectiveState, ChatMessage, DetectiveInput, DetectiveReport, Egress, Event, FinishReason,
-    HistoryStore, LlmClient, LlmRequest, LlmResponse, NekoError, ReplyOut, TokenUsage,
+    HistoryStore, LlmClient, LlmRequest, LlmResponse, NekoError, ReplyCooldown, ReplyOut,
+    TokenUsage,
 };
 use neko_gate::{GateActor, GateConfig};
 use neko_memory::SqliteStore;
@@ -267,6 +268,7 @@ async fn council_replies_directly_when_decision_is_reply() {
             context_limit: 5,
             llm_temperature: 0.9,
             llm_max_tokens: 128,
+            ..Default::default()
         },
         council_llm,
         history,
@@ -329,6 +331,7 @@ async fn council_launches_detective_when_decision_is_detective() {
             context_limit: 5,
             llm_temperature: 0.9,
             llm_max_tokens: 128,
+            ..Default::default()
         },
         council_llm,
         history,
@@ -369,7 +372,7 @@ async fn council_launches_detective_when_decision_is_detective() {
 }
 
 #[tokio::test]
-async fn detective_produces_report_and_reply_when_confident() {
+async fn detective_produces_correlated_report() {
     let sqlite = SqliteStore::connect_in_memory().await.unwrap();
     let history: Arc<dyn HistoryStore + Send + Sync> = Arc::new(sqlite);
 
@@ -401,35 +404,33 @@ async fn detective_produces_report_and_reply_when_confident() {
         let _ = detective.run(detective_rx, out_tx).await;
     });
 
-    let input = DetectiveInput {
-        message: make_message("你觉得我怎么样？"),
-        state: AffectiveState::default(),
-        target_user: "67890".to_string(),
-    };
+    let msg = make_message("你觉得我怎么样？");
+    let message_id = msg.id;
     detective_tx
-        .send(Event::DetectiveRequest(input))
+        .send(Event::DetectiveRequest(DetectiveInput {
+            message: msg,
+            state: AffectiveState::default(),
+            target_user: "67890".to_string(),
+        }))
         .await
         .unwrap();
 
     let event = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
         .await
         .expect("timeout waiting for detective report")
-        .expect("output channel closed");
-    assert!(
-        matches!(event, Event::DetectiveReport(_)),
-        "expected DetectiveReport, got {event:?}"
-    );
-
-    let event = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
-        .await
-        .expect("timeout waiting for detective reply")
-        .expect("output channel closed");
+        .expect("channel closed");
     match event {
-        Event::ReplyOut(ReplyOut { layer, .. }) => {
-            assert_eq!(layer, "detective");
+        Event::DetectiveReport(report) => {
+            assert_eq!(report.message_id, message_id);
+            assert_eq!(report.group_id, "12345");
+            assert_eq!(report.target_user, "67890");
         }
-        other => panic!("expected ReplyOut, got {other:?}"),
+        other => panic!("expected DetectiveReport, got {other:?}"),
     }
+
+    // The detective no longer replies directly; the council owns that.
+    let maybe_reply = tokio::time::timeout(Duration::from_millis(200), out_rx.recv()).await;
+    assert!(maybe_reply.is_err() || maybe_reply.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -523,6 +524,7 @@ async fn spawn_dispatcher(
                 &council_tx,
                 &detective_tx,
                 &solidify_tx,
+                None,
             )
             .await;
         }
@@ -555,6 +557,7 @@ async fn router_routes_reply_out_to_egress_sensory_and_sqlite() {
         &council_tx,
         &detective_tx,
         &solidify_tx,
+        None,
     )
     .await
     .unwrap();
@@ -588,6 +591,7 @@ async fn router_persists_gate_and_council_decisions() {
         &council_tx,
         &detective_tx,
         &solidify_tx,
+        None,
     )
     .await
     .unwrap();
@@ -604,6 +608,7 @@ async fn router_persists_gate_and_council_decisions() {
         &council_tx,
         &detective_tx,
         &solidify_tx,
+        None,
     )
     .await
     .unwrap();
@@ -632,6 +637,7 @@ async fn router_forwards_events_to_downstream_layers() {
             &council_tx,
             &detective_tx,
             &solidify_tx,
+            None,
         )
     };
 
@@ -667,15 +673,25 @@ async fn router_forwards_events_to_downstream_layers() {
     ));
 
     dispatch(Event::DetectiveReport(DetectiveReport {
+        message_id: Uuid::new_v4(),
+        group_id: "12345".to_string(),
         target_user: "67890".to_string(),
         ..Default::default()
     }))
     .await
     .unwrap();
+    // Reports fan out to the council (for the final reply) and to solidify.
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), council_rx.recv())
+            .await
+            .expect("timeout waiting for council report")
+            .unwrap(),
+        Event::DetectiveReport(_)
+    ));
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(1), solidify_rx.recv())
             .await
-            .expect("timeout waiting for solidify event")
+            .expect("timeout waiting for solidify report")
             .unwrap(),
         Event::DetectiveReport(_)
     ));
@@ -688,6 +704,87 @@ async fn router_forwards_events_to_downstream_layers() {
             .unwrap(),
         Event::SolidifyTick
     ));
+}
+
+#[tokio::test]
+async fn router_applies_reply_cooldown() {
+    let sqlite = SqliteStore::connect_in_memory().await.unwrap();
+    let egress = Arc::new(MockEgress::default());
+    let (sensory_tx, _sensory_rx) = mpsc::channel(16);
+    let (council_tx, _council_rx) = mpsc::channel(16);
+    let (detective_tx, _detective_rx) = mpsc::channel(16);
+    let (solidify_tx, _solidify_rx) = mpsc::channel(16);
+
+    let cooldown = ReplyCooldown::new(Duration::from_secs(60));
+    let reply = || ReplyOut {
+        id: Uuid::new_v4(),
+        reply_to: Uuid::new_v4(),
+        group_id: "12345".to_string(),
+        target_user: "67890".to_string(),
+        content: "喵".to_string(),
+        layer: "council".to_string(),
+    };
+
+    // First reply is allowed; the second, within the interval, is suppressed.
+    neko_router::router::dispatch_event(
+        Event::ReplyOut(reply()),
+        egress.as_ref(),
+        &sqlite,
+        &sensory_tx,
+        &council_tx,
+        &detective_tx,
+        &solidify_tx,
+        Some(&cooldown),
+    )
+    .await
+    .unwrap();
+    neko_router::router::dispatch_event(
+        Event::ReplyOut(reply()),
+        egress.as_ref(),
+        &sqlite,
+        &sensory_tx,
+        &council_tx,
+        &detective_tx,
+        &solidify_tx,
+        Some(&cooldown),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(egress.sent.lock().await.len(), 1);
+    assert_eq!(sqlite.count_replies().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn router_routes_daily_context_to_council_and_sqlite() {
+    let sqlite = SqliteStore::connect_in_memory().await.unwrap();
+    let egress = Arc::new(MockEgress::default());
+    let (sensory_tx, _sensory_rx) = mpsc::channel(16);
+    let (council_tx, mut council_rx) = mpsc::channel(16);
+    let (detective_tx, _detective_rx) = mpsc::channel(16);
+    let (solidify_tx, _solidify_rx) = mpsc::channel(16);
+
+    neko_router::router::dispatch_event(
+        Event::DailyContext("用户 A 与 用户 B 关系亲密。".to_string()),
+        egress.as_ref(),
+        &sqlite,
+        &sensory_tx,
+        &council_tx,
+        &detective_tx,
+        &solidify_tx,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), council_rx.recv())
+            .await
+            .expect("timeout waiting for daily context")
+            .unwrap(),
+        Event::DailyContext(_)
+    ));
+    assert_eq!(sqlite.count_events().await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -771,4 +868,99 @@ async fn full_pipeline_replies_through_router() {
     assert_eq!(sqlite.count_events().await.unwrap(), 1);
 
     let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn detective_feedback_loop_replies_through_router() {
+    let sqlite = SqliteStore::connect_in_memory().await.unwrap();
+    let history: Arc<dyn HistoryStore + Send + Sync> = Arc::new(sqlite.clone());
+
+    let (router_tx, router_rx) = mpsc::channel(64);
+    let (sensory_tx, _sensory_rx) = mpsc::channel(16);
+    let (council_tx, council_rx) = mpsc::channel(16);
+    let (detective_tx, detective_rx) = mpsc::channel(16);
+    let (solidify_tx, _solidify_rx) = mpsc::channel(16);
+
+    let egress = Arc::new(MockEgress::default());
+
+    let council = neko_council::CouncilActor::new(
+        neko_council::CouncilConfig::default(),
+        MockLlmClient::new(vec![serde_json::json!({
+            "action": "detective",
+            "reasoning": "需要更多上下文",
+            "draft_reply": ""
+        })
+        .to_string()]),
+        history,
+    );
+    let detective_report = DetectiveReport {
+        target_user: "67890".to_string(),
+        summary: "用户喜欢简短回复。".to_string(),
+        confidence: 0.9,
+        recommended_tone: neko_core::Tone::Warm,
+        ..Default::default()
+    };
+    let detective = neko_detective::DetectiveActor::new(
+        neko_detective::DetectiveConfig::default(),
+        MockLlmClient::new(vec![serde_json::to_string(&detective_report).unwrap()]),
+        Arc::new(neko_memory::SqliteStore::connect_in_memory().await.unwrap()),
+        Arc::new(neko_detective::InMemoryVectorStore::new()),
+    );
+
+    let council_tx_actor = router_tx.clone();
+    tokio::spawn(async move {
+        let _ = council.run(council_rx, council_tx_actor).await;
+    });
+    tokio::spawn(async move {
+        let _ = detective.run(detective_rx, router_tx).await;
+    });
+    spawn_dispatcher(
+        router_rx,
+        egress.clone(),
+        sqlite.clone(),
+        sensory_tx.clone(),
+        council_tx.clone(),
+        detective_tx.clone(),
+        solidify_tx.clone(),
+    )
+    .await;
+
+    // An escalation that the council hands to the detective.
+    let msg = make_message("你怎么看我？");
+    neko_router::router::dispatch_event(
+        Event::Escalation(
+            neko_core::EscalationReason::NeedsContext,
+            msg,
+            AffectiveState::default(),
+        ),
+        egress.as_ref(),
+        &sqlite,
+        &sensory_tx,
+        &council_tx,
+        &detective_tx,
+        &solidify_tx,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // council -> detective -> report -> council reply -> egress
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !egress.sent.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("timeout waiting for feedback-loop reply");
+
+    let sent = egress.sent.lock().await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].content, "温柔地 用户喜欢简短回复。");
+    assert_eq!(sent[0].layer, "council");
+    drop(sent);
+
+    assert_eq!(sqlite.count_replies().await.unwrap(), 1);
 }

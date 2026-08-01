@@ -22,3 +22,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-cron-scheduler = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

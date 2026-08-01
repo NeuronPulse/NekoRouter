@@ -88,6 +88,9 @@ pub enum Event {
     ReplyOut(ReplyOut),
     /// Daily solidification trigger.
     SolidifyTick,
+    /// Nightly graph summary produced by solidify, fed back to the council so
+    /// long-term relationships influence future replies.
+    DailyContext(String),
 }
 
 /// Reasons for dropping or escalating a message.
@@ -125,6 +128,9 @@ pub struct CouncilInput {
     pub message: ChatMessage,
     pub state: AffectiveState,
     pub context: Vec<ChatMessage>,
+    /// Nightly graph summary (from solidify), empty when none has been
+    /// produced yet.
+    pub daily_context: String,
 }
 
 /// Decision made by the council layer.
@@ -151,8 +157,17 @@ pub struct DetectiveInput {
 }
 
 /// A structured, dehydrated report produced by the detective.
+///
+/// `message_id`/`group_id` are filled in by the detective actor (not the LLM)
+/// so the report can be correlated back to the message that triggered it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DetectiveReport {
+    /// The message id that triggered this report. Set by the detective actor.
+    #[serde(default)]
+    pub message_id: MessageId,
+    /// The group the target user belongs to. Set by the detective actor.
+    #[serde(default)]
+    pub group_id: GroupId,
     pub target_user: UserId,
     pub summary: String,
     pub historical_facts: Vec<Fact>,

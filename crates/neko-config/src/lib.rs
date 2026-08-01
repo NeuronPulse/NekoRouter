@@ -98,6 +98,9 @@ pub struct PersonalityConfig {
     pub max_cozy_words: usize,
     pub max_message_length: usize,
     pub energy_decay_per_min: f32,
+    /// Minimum seconds between bot replies in the same group (0 = disabled).
+    #[serde(default)]
+    pub min_reply_interval_sec: u64,
     pub favor_decay_per_min: f32,
 }
 
@@ -118,7 +121,21 @@ impl NekoConfig {
     /// 5. Environment variables prefixed with `NEKO__` using `__` as separator.
     pub fn load() -> Result<Self, NekoError> {
         let _ = dotenvy::dotenv();
+        let mut config = Self::build()?;
+        config.expand_env_placeholders();
+        config.validate()?;
+        Ok(config)
+    }
 
+    /// Load configuration without expanding secrets or validating providers.
+    /// Used by tooling (e.g. `--observe`) that only needs non-secret fields
+    /// like `sqlite.path` and must not hard-fail when API keys are absent.
+    pub fn load_observe() -> Result<Self, NekoError> {
+        let _ = dotenvy::dotenv();
+        Self::build()
+    }
+
+    fn build() -> Result<Self, NekoError> {
         let root = project_root()?;
         let env_name = env::var("NEKO_ENV").unwrap_or_else(|_| "local".to_string());
 
@@ -143,13 +160,8 @@ impl NekoConfig {
             .build()
             .map_err(|e| NekoError::config(format!("failed to build config: {e}")))?;
 
-        let mut config: NekoConfig = cfg
-            .try_deserialize()
-            .map_err(|e| NekoError::config(format!("failed to deserialize config: {e}")))?;
-
-        config.expand_env_placeholders();
-        config.validate()?;
-        Ok(config)
+        cfg.try_deserialize()
+            .map_err(|e| NekoError::config(format!("failed to deserialize config: {e}")))
     }
 
     /// Expand `${VAR}` placeholders in provider API keys, embedding key and Neo4j password.

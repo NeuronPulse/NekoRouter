@@ -66,6 +66,7 @@ pub fn parse_onebot11_group_message(payload: &Value) -> Option<ChatMessage> {
 
     Some(ChatMessage {
         id,
+        trace_id: uuid::Uuid::new_v4(),
         group_id: GroupId::from(group_id.to_string()),
         sender: UserId::from(user_id.to_string()),
         nickname,

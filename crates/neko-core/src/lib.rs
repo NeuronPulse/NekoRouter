@@ -6,6 +6,7 @@ pub mod types;
 pub use cooldown::ReplyCooldown;
 pub use error::NekoError;
 pub use traits::{
-    Egress, EmbeddingClient, GraphStore, HistoryStore, Ingress, LlmClient, VectorStore,
+    CooldownStore, Egress, EmbeddingClient, GraphStore, HistoryStore, Ingress, LlmClient,
+    VectorStore,
 };
 pub use types::*;

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 /// NapCat / OneBot 11 compatible ingress using the official `napcat-link` SDK.
 pub struct NapCatIngress {
@@ -33,6 +33,17 @@ impl NapCatIngress {
     /// Total number of messages dropped due to backpressure.
     pub fn drop_count(&self) -> u64 {
         self.drop_count.load(Ordering::Relaxed)
+    }
+}
+
+impl Clone for NapCatIngress {
+    fn clone(&self) -> Self {
+        Self {
+            url: self.url.clone(),
+            token: self.token.clone(),
+            reconnect_interval: self.reconnect_interval,
+            drop_count: self.drop_count.clone(),
+        }
     }
 }
 
@@ -77,6 +88,10 @@ impl Ingress for NapCatIngress {
             tokio::time::sleep(self.reconnect_interval).await;
         }
     }
+
+    fn drop_count(&self) -> u64 {
+        self.drop_count()
+    }
 }
 
 async fn run_once(
@@ -108,8 +123,14 @@ async fn run_once(
                     if event.name.starts_with("message.group") {
                         if let Some(msg) = crate::parser::parse_onebot11_group_message(&event.data)
                         {
-                            debug!("parsed message from {}", msg.sender);
-                            if !push_or_drop(&out_for_listener, msg, &drops) {
+                            let trace_id = msg.trace_id;
+                            let keep_going = async {
+                                debug!("parsed message from {}", msg.sender);
+                                push_or_drop(&out_for_listener, msg, &drops)
+                            }
+                            .instrument(info_span!("ingress_message", trace_id = %trace_id))
+                            .await;
+                            if !keep_going {
                                 warn!("router channel closed, ingress listener exiting");
                                 break;
                             }
@@ -172,6 +193,7 @@ mod tests {
     fn message(content: &str) -> ChatMessage {
         ChatMessage {
             id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
             group_id: "g1".to_string(),
             sender: "u1".to_string(),
             nickname: "Alice".to_string(),

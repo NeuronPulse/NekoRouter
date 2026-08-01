@@ -1,6 +1,7 @@
 use chrono::Utc;
-use neko_core::{Egress, Event, NekoError, ReplyCooldown, ReplyOut};
+use neko_core::{Egress, Event, NekoError, ReplyCooldown, ReplyOut, RuntimeState};
 use neko_memory::SqliteStore;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -23,8 +24,34 @@ pub async fn dispatch_event(
     solidify_tx: &mpsc::Sender<Event>,
     cooldown: Option<&ReplyCooldown>,
 ) -> Result<(), NekoError> {
+    dispatch_event_with_state(
+        event,
+        egress,
+        sqlite,
+        sensory_routed,
+        council_tx,
+        detective_tx,
+        solidify_tx,
+        cooldown,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_event_with_state(
+    event: Event,
+    egress: &dyn Egress,
+    sqlite: &SqliteStore,
+    sensory_routed: &mpsc::Sender<Event>,
+    council_tx: &mpsc::Sender<Event>,
+    detective_tx: &mpsc::Sender<Event>,
+    solidify_tx: &mpsc::Sender<Event>,
+    cooldown: Option<&ReplyCooldown>,
+    runtime_state: Option<&Arc<RuntimeState>>,
+) -> Result<(), NekoError> {
     match event {
-        Event::ReplyOut(reply) => {
+        Event::ReplyOut(mut reply) => {
             if let Some(cooldown) = cooldown {
                 if !cooldown.allow(&reply.group_id) {
                     warn!(
@@ -34,8 +61,21 @@ pub async fn dispatch_event(
                     return Ok(());
                 }
             }
+            // Resolve the platform id of the replied-to message so the egress
+            // can send a quote reply; degrade to plain text when unavailable.
+            if reply.reply_to_platform.is_none() {
+                reply.reply_to_platform = sqlite
+                    .platform_message_id(reply.reply_to)
+                    .await
+                    .unwrap_or(None);
+            }
             persist_reply(sqlite, &reply).await?;
             egress.send(reply.clone()).await?;
+            if let Some(state) = runtime_state {
+                state
+                    .replies_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             sensory_routed
                 .send(Event::ReplyOut(reply))
                 .await

@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
-use neko_core::{AffectiveState, ChatMessage, GroupId, HistoryStore, NekoError, UserId};
+use neko_core::{
+    AffectiveState, ChatMessage, CooldownStore, GroupId, HistoryStore, NekoError, UserId,
+};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Pool, QueryBuilder, Sqlite, SqlitePool};
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 use tracing::{debug, info};
@@ -95,6 +98,36 @@ impl SqliteStore {
 
         debug!("inserted {} messages", messages.len());
         Ok(())
+    }
+
+    /// Resolve the platform (OneBot) message id for an internal message id,
+    /// extracted from the stored raw payload. Returns `None` when the message
+    /// has not been flushed yet or the payload has no usable id.
+    pub async fn platform_message_id(
+        &self,
+        id: neko_core::MessageId,
+    ) -> Result<Option<String>, NekoError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT raw_payload FROM messages WHERE id = ?")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| NekoError::database(format!("query message payload failed: {e}")))?;
+
+        let Some((payload,)) = row else {
+            return Ok(None);
+        };
+
+        let value: serde_json::Value = match serde_json::from_str(&payload) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+
+        Ok(match value.get("message_id") {
+            Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
     }
 
     /// Record a sent reply.
@@ -381,6 +414,44 @@ fn timestamp_to_utc(millis: i64) -> Result<DateTime<Utc>, NekoError> {
 }
 
 #[async_trait]
+impl CooldownStore for SqliteStore {
+    async fn load_cooldowns(&self) -> Result<HashMap<GroupId, DateTime<Utc>>, NekoError> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT group_id, watermark FROM reply_cooldowns")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| NekoError::database(format!("load cooldowns failed: {e}")))?;
+
+        rows.into_iter()
+            .map(|(group_id, watermark)| {
+                let dt = Utc
+                    .timestamp_millis_opt(watermark)
+                    .single()
+                    .ok_or_else(|| NekoError::database("invalid cooldown timestamp"))?;
+                Ok((group_id, dt))
+            })
+            .collect()
+    }
+
+    async fn save_cooldown(
+        &self,
+        group_id: &GroupId,
+        watermark: DateTime<Utc>,
+    ) -> Result<(), NekoError> {
+        sqlx::query(
+            "INSERT INTO reply_cooldowns (group_id, watermark) VALUES (?, ?) \
+             ON CONFLICT(group_id) DO UPDATE SET watermark = excluded.watermark",
+        )
+        .bind(group_id)
+        .bind(watermark.timestamp_millis())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| NekoError::database(format!("save cooldown failed: {e}")))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl HistoryStore for SqliteStore {
     async fn append_batch(&self, messages: &[ChatMessage]) -> Result<(), NekoError> {
         self.insert_messages(messages).await
@@ -496,6 +567,7 @@ impl TryFrom<MessageRow> for ChatMessage {
 
         Ok(ChatMessage {
             id,
+            trace_id: id,
             group_id: row.group_id,
             sender: row.sender_id,
             nickname: row.sender_nick.unwrap_or_default(),
@@ -510,7 +582,7 @@ impl TryFrom<MessageRow> for ChatMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{SubsecRound, TimeZone};
 
     #[tokio::test]
     async fn affective_states_round_trip() {
@@ -576,6 +648,37 @@ mod tests {
             .find(|(g, u, _)| g == "g1" && u == "u1")
             .unwrap();
         assert_eq!(s.energy, 0.9);
+    }
+
+    #[tokio::test]
+    async fn cooldown_watermarks_round_trip() {
+        let store = SqliteStore::connect_in_memory().await.unwrap();
+        // SQLite stores millisecond timestamps, so truncate sub-millisecond
+        // precision to make equality assertions stable.
+        let now = Utc::now().trunc_subsecs(3);
+        let g1 = "g1".to_string();
+        let g2 = "g2".to_string();
+
+        store.save_cooldown(&g1, now).await.unwrap();
+        store
+            .save_cooldown(&g2, now - chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+
+        let loaded = store.load_cooldowns().await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get(&g1).copied(), Some(now));
+        assert_eq!(
+            loaded.get(&g2).copied(),
+            Some(now - chrono::Duration::seconds(30))
+        );
+
+        // Re-saving upserts instead of duplicating.
+        let later = now + chrono::Duration::seconds(10);
+        store.save_cooldown(&g1, later).await.unwrap();
+        let loaded = store.load_cooldowns().await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get(&g1).copied(), Some(later));
     }
 }
 

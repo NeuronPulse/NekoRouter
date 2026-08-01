@@ -37,6 +37,11 @@ CREATE TABLE IF NOT EXISTS events (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS reply_cooldowns (
+    group_id TEXT PRIMARY KEY,
+    watermark INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_group_time ON messages(group_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_kind_time ON events(kind, created_at);

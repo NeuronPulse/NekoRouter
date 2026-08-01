@@ -39,15 +39,26 @@ impl VectorStore for InMemoryVectorStore {
         query_text: &str,
         top_k: usize,
     ) -> Result<Vec<MemoryRecord>, NekoError> {
+        let scored = self.search_with_score(group_id, query_text, top_k).await?;
+        Ok(scored.into_iter().map(|(_, record)| record).collect())
+    }
+
+    async fn search_with_score(
+        &self,
+        group_id: &GroupId,
+        query_text: &str,
+        top_k: usize,
+    ) -> Result<Vec<(f32, MemoryRecord)>, NekoError> {
         let store = self.records.lock().unwrap();
 
-        let query_words: Vec<String> = query_text
+        let query_lower = query_text.to_lowercase();
+        let query_words: Vec<String> = query_lower
             .split_whitespace()
-            .map(|s| s.to_lowercase())
             .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
             .collect();
 
-        let mut matched: Vec<MemoryRecord> = store
+        let mut matched: Vec<(f32, MemoryRecord)> = store
             .values()
             .filter(|record| record.group_id == *group_id)
             .filter(|record| {
@@ -57,11 +68,23 @@ impl VectorStore for InMemoryVectorStore {
                 let text = record.text.to_lowercase();
                 query_words.iter().any(|word| text.contains(word))
             })
-            .cloned()
+            .map(|record| {
+                // Crude similarity for the in-memory fallback: exact match or
+                // full containment scores 1.0, partial word overlap scores 0.5.
+                let text_lower = record.text.to_lowercase();
+                let score = if text_lower == query_lower
+                    || text_lower.contains(&query_lower)
+                    || query_lower.contains(&text_lower)
+                {
+                    1.0
+                } else {
+                    0.5
+                };
+                (score, record.clone())
+            })
             .collect();
 
-        // Return the most recent records first as a crude relevance signal.
-        matched.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        matched.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         matched.truncate(top_k);
 
         Ok(matched)
@@ -158,5 +181,22 @@ mod tests {
         let results = store.search(&"g1".to_string(), "", 10).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].text, "new");
+    }
+
+    #[tokio::test]
+    async fn search_with_score_ranks_exact_matches_highest() {
+        let store = InMemoryVectorStore::new();
+        let r1 = record("g1", "hello world");
+        let r2 = record("g1", "goodbye");
+
+        store.embed_and_upsert(&[r1.clone(), r2]).await.unwrap();
+
+        let scored = store
+            .search_with_score(&"g1".to_string(), "hello world", 10)
+            .await
+            .unwrap();
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].0, 1.0);
+        assert_eq!(scored[0].1.text, "hello world");
     }
 }

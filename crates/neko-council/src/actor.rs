@@ -8,7 +8,7 @@ use neko_core::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 #[derive(Debug, Clone)]
 pub struct CouncilConfig {
@@ -84,20 +84,28 @@ impl<C: LlmClient + 'static> CouncilActor<C> {
                         Event::Escalation(_, msg, state) => {
                             let this = self.clone();
                             let out = out.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = this.handle_escalation(msg, state, out).await {
-                                    warn!("council handle error: {e}");
+                            let trace_id = msg.trace_id;
+                            tokio::spawn(
+                                async move {
+                                    if let Err(e) = this.handle_escalation(msg, state, out).await {
+                                        warn!("council handle error: {e}");
+                                    }
                                 }
-                            });
+                                .instrument(info_span!("council_escalation", trace_id = %trace_id)),
+                            );
                         }
                         Event::DetectiveReport(report) => {
                             let this = self.clone();
                             let out = out.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = this.handle_report(report, out).await {
-                                    warn!("council report error: {e}");
+                            let trace_id = report.trace_id;
+                            tokio::spawn(
+                                async move {
+                                    if let Err(e) = this.handle_report(report, out).await {
+                                        warn!("council report error: {e}");
+                                    }
                                 }
-                            });
+                                .instrument(info_span!("council_report", trace_id = %trace_id)),
+                            );
                         }
                         Event::DailyContext(ctx) => {
                             self.store_daily_context(ctx);
@@ -205,10 +213,12 @@ impl<C: LlmClient + 'static> CouncilActor<C> {
                 out.send(Event::ReplyOut(ReplyOut {
                     id: uuid::Uuid::new_v4(),
                     reply_to: msg.id,
+                    reply_to_platform: None,
                     group_id: msg.group_id,
                     target_user: msg.sender,
                     content: reply,
                     layer: "council".to_string(),
+                    trace_id: msg.trace_id,
                 }))
                 .await
                 .map_err(|_| NekoError::transport("router channel closed"))?;
@@ -263,10 +273,12 @@ impl<C: LlmClient + 'static> CouncilActor<C> {
         out.send(Event::ReplyOut(ReplyOut {
             id: uuid::Uuid::new_v4(),
             reply_to: report.message_id,
+            reply_to_platform: None,
             group_id: report.group_id,
             target_user: report.target_user,
             content: reply,
             layer: "council".to_string(),
+            trace_id: report.trace_id,
         }))
         .await
         .map_err(|_| NekoError::transport("router channel closed"))?;
@@ -372,6 +384,7 @@ mod tests {
     fn make_message(content: &str) -> ChatMessage {
         ChatMessage {
             id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
             group_id: "12345".to_string(),
             sender: "67890".to_string(),
             nickname: "Alice".to_string(),

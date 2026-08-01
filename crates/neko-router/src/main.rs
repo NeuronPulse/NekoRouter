@@ -1,12 +1,12 @@
 use neko_config::{NekoConfig, Neo4jConfig, ResponseFormatConfig};
 use neko_core::{
-    Egress, Event, GraphStore, HistoryStore, Ingress, NekoError, ResponseFormat, VectorStore,
+    CooldownStore, Egress, Event, GraphStore, HistoryStore, Ingress, NekoError, ResponseFormat,
+    RuntimeState, VectorStore,
 };
 use neko_detective::{DetectiveActor, DetectiveConfig, InMemoryVectorStore, QdrantVectorStore};
 use neko_gate::{GateActor, GateConfig};
 use neko_llm::{OpenAiCompatibleClient, OpenAiEmbeddingClient};
 use neko_memory::SqliteStore;
-use neko_router::router::dispatch_event;
 use neko_sensory::{NapCatEgress, NapCatIngress, SensoryActor, SensoryConfig};
 use neko_solidify::{InMemoryGraphStore, Neo4jGraphStore, SolidifyActor, SolidifyConfig};
 use secrecy::ExposeSecret;
@@ -82,6 +82,11 @@ impl Router {
         let (detective_tx, detective_rx) = mpsc::channel::<Event>(1024);
         let (solidify_tx, solidify_rx) = mpsc::channel::<Event>(1024);
 
+        let runtime_state = Arc::new(RuntimeState {
+            started_at: chrono::Utc::now(),
+            ..Default::default()
+        });
+
         let sqlite_arc: Arc<dyn HistoryStore + Send + Sync> = Arc::new(self.sqlite.clone());
         let vector_store: Arc<dyn VectorStore + Send + Sync> =
             build_vector_store(&self.config.qdrant, &self.config.embedding).await?;
@@ -121,7 +126,8 @@ impl Router {
             concurrency_limit: 8,
             heuristic: "default".to_string(),
         };
-        let gate_actor = GateActor::new(gate_config, gate_llm);
+        let gate_actor =
+            GateActor::new_with_state(gate_config, gate_llm, Some(runtime_state.clone()));
 
         // Layer 3: council.
         let council_provider = self.config.council_provider()?;
@@ -154,6 +160,7 @@ impl Router {
             memory_top_k: 5,
             llm_temperature: detective_provider.temperature,
             llm_max_tokens: detective_provider.max_tokens.unwrap_or(1024),
+            fact_dedup_threshold: 0.92,
         };
         let detective_llm = OpenAiCompatibleClient::new(
             "detective",
@@ -209,9 +216,28 @@ impl Router {
             build_solidify_scheduler(&self.config.solidify, solidify_tx.clone()).await?;
 
         let shutdown_for_ingress = self.shutdown.clone();
+        let ingress_for_task = ingress.clone();
         let ingress_handle = tokio::spawn(async move {
-            if let Err(e) = ingress.run(raw_tx, shutdown_for_ingress).await {
+            if let Err(e) = ingress_for_task.run(raw_tx, shutdown_for_ingress).await {
                 error!("ingress task error: {e}");
+            }
+        });
+
+        // Runtime status HTTP endpoint.
+        let status_bind_addr = format!("{}:{}", self.config.status.host, self.config.status.port);
+        let status_ingress: Arc<dyn Ingress + Send + Sync> = Arc::new(ingress.clone());
+        let status_state = runtime_state.clone();
+        let shutdown_for_status = self.shutdown.clone();
+        let _status_handle = tokio::spawn(async move {
+            if let Err(e) = neko_router::status::run_status_server(
+                status_bind_addr,
+                status_state,
+                status_ingress,
+                shutdown_for_status,
+            )
+            .await
+            {
+                error!("status server error: {e}");
             }
         });
 
@@ -259,9 +285,12 @@ impl Router {
         // channel and persist observability records.
         let mut shutdown_for_dispatcher = self.shutdown.clone();
         let sqlite_for_dispatcher = self.sqlite.clone();
-        let reply_cooldown = neko_core::ReplyCooldown::new(std::time::Duration::from_secs(
-            self.config.personality.min_reply_interval_sec,
-        ));
+        let cooldown_store: Arc<dyn CooldownStore> = Arc::new(self.sqlite.clone());
+        let reply_cooldown = neko_core::ReplyCooldown::new_with_store(
+            std::time::Duration::from_secs(self.config.personality.min_reply_interval_sec),
+            cooldown_store,
+        )
+        .await?;
         let dispatcher_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -272,19 +301,20 @@ impl Router {
                         }
                     }
                     Some(event) = router_rx.recv() => {
-                        if let Err(e) = dispatch_event(
-                            event,
-                            egress.as_ref(),
-                            &sqlite_for_dispatcher,
-                            &sensory_routed_tx,
-                            &council_tx,
-                            &detective_tx,
-                            &solidify_tx,
-                            Some(&reply_cooldown),
-                        ).await {
-                            error!("dispatch error: {e}");
+                            if let Err(e) = neko_router::router::dispatch_event_with_state(
+                                event,
+                                egress.as_ref(),
+                                &sqlite_for_dispatcher,
+                                &sensory_routed_tx,
+                                &council_tx,
+                                &detective_tx,
+                                &solidify_tx,
+                                Some(&reply_cooldown),
+                                Some(&runtime_state),
+                            ).await {
+                                error!("dispatch error: {e}");
+                            }
                         }
-                    }
                 }
             }
         });

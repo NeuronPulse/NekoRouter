@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, Mutex};
-use tracing::{debug, trace};
+use tracing::{debug, info_span, trace, Instrument};
 
 /// Configuration for the sensory actor.
 #[derive(Debug, Clone, Copy)]
@@ -104,8 +104,18 @@ impl<HS: HistoryStore> SensoryActor<HS> {
         outbound: &mpsc::Sender<Event>,
     ) -> Result<(), NekoError> {
         match event {
-            Event::IncomingMessage(msg) => self.handle_message(msg, outbound).await,
-            Event::ReplyOut(reply) => self.handle_reply(reply).await,
+            Event::IncomingMessage(msg) => {
+                let trace_id = msg.trace_id;
+                self.handle_message(msg, outbound)
+                    .instrument(info_span!("sensory_message", trace_id = %trace_id))
+                    .await
+            }
+            Event::ReplyOut(reply) => {
+                let trace_id = reply.trace_id;
+                self.handle_reply(reply)
+                    .instrument(info_span!("sensory_reply", trace_id = %trace_id))
+                    .await
+            }
             _ => Ok(()),
         }
     }

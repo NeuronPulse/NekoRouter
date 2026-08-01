@@ -7,7 +7,12 @@ use reqwest::header::{self, HeaderMap, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
+
+/// Number of extra attempts after the first failure (total = max_retries + 1).
+const DEFAULT_MAX_RETRIES: u32 = 2;
+/// Base delay for the exponential backoff (doubles each retry).
+const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
 /// An OpenAI-compatible LLM client.
 /// Works with DeepSeek, Grok, Gemini OpenAI-compatible endpoints, etc.
@@ -23,6 +28,8 @@ pub struct OpenAiCompatibleClient {
     default_temperature: f32,
     default_max_tokens: Option<u32>,
     default_response_format: ResponseFormat,
+    max_retries: u32,
+    retry_base_delay: Duration,
 }
 
 impl OpenAiCompatibleClient {
@@ -36,7 +43,10 @@ impl OpenAiCompatibleClient {
         default_response_format: ResponseFormat,
     ) -> Result<Self, NekoError> {
         let base_url = base_url.as_ref().trim_end_matches('/');
-        let base_url = reqwest::Url::parse(base_url)
+        // Ensure the base URL ends with `/` so `join("chat/completions")` appends
+        // rather than replaces the last path segment (e.g. `/v1` -> `/v1/...`).
+        let base_url = format!("{base_url}/");
+        let base_url = reqwest::Url::parse(&base_url)
             .map_err(|e| NekoError::config(format!("invalid base_url: {e}")))?;
 
         let mut headers = HeaderMap::new();
@@ -65,7 +75,15 @@ impl OpenAiCompatibleClient {
             default_temperature,
             default_max_tokens,
             default_response_format,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_base_delay: DEFAULT_RETRY_BASE_DELAY,
         })
+    }
+
+    /// Override the number of extra retries on transient failures.
+    pub fn with_retry(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
     }
 
     pub fn name(&self) -> &str {
@@ -95,14 +113,49 @@ impl LlmClient for OpenAiCompatibleClient {
             },
         };
 
+        // Retry transient failures (network blips, 429, 5xx) with exponential
+        // backoff. Hard errors (4xx except 429, malformed responses) are not
+        // retried.
+        let mut attempt = 0u32;
+        loop {
+            match self.try_complete_once(url.clone(), &body).await {
+                Ok(resp) => return Ok(resp),
+                Err(NekoError::Transient(msg)) => {
+                    if attempt >= self.max_retries {
+                        warn!(
+                            "llm request failed after {} retries: {msg}",
+                            self.max_retries
+                        );
+                        return Err(NekoError::transport(msg));
+                    }
+                    attempt += 1;
+                    let delay = self.retry_base_delay.saturating_mul(1u32 << (attempt - 1));
+                    warn!(
+                        "llm transient failure (retry {attempt}/{}): {msg}; retrying in {delay:?}",
+                        self.max_retries
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl OpenAiCompatibleClient {
+    /// One attempt at a chat completion, tagging retryable failures.
+    async fn try_complete_once(
+        &self,
+        url: reqwest::Url,
+        body: &ChatCompletionRequest,
+    ) -> Result<LlmResponse, NekoError> {
         debug!("sending request to {}", url);
-        let resp = self
-            .http
-            .post(url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| NekoError::transport(format!("llm request failed: {e}")))?;
+        let resp = match self.http.post(url).json(body).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(NekoError::transient(format!("llm request failed: {e}")));
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -110,6 +163,11 @@ impl LlmClient for OpenAiCompatibleClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<no body>".to_string());
+            if status.as_u16() == 429 || status.is_server_error() {
+                return Err(NekoError::transient(format!(
+                    "llm returned {status}: {text}"
+                )));
+            }
             error!("llm returned {}: {}", status, text);
             return Err(NekoError::llm(format!("llm returned {status}: {text}")));
         }

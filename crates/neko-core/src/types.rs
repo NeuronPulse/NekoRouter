@@ -15,6 +15,8 @@ pub type UserId = String;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub id: MessageId,
+    /// Trace id that follows this message through all layers.
+    pub trace_id: MessageId,
     pub group_id: GroupId,
     pub sender: UserId,
     pub nickname: String,
@@ -165,6 +167,9 @@ pub struct DetectiveReport {
     /// The message id that triggered this report. Set by the detective actor.
     #[serde(default)]
     pub message_id: MessageId,
+    /// Trace id that follows the triggering message through all layers.
+    #[serde(default)]
+    pub trace_id: MessageId,
     /// The group the target user belongs to. Set by the detective actor.
     #[serde(default)]
     pub group_id: GroupId,
@@ -233,10 +238,15 @@ pub struct GraphUpdate {
 pub struct ReplyOut {
     pub id: MessageId,
     pub reply_to: MessageId,
+    /// Platform (OneBot) id of the replied-to message, resolved from the
+    /// history store when available. Used by egress to send a quote reply.
+    pub reply_to_platform: Option<String>,
     pub group_id: GroupId,
     pub target_user: UserId,
     pub content: String,
     pub layer: String,
+    /// Trace id that follows the triggering message through all layers.
+    pub trace_id: MessageId,
 }
 
 /// A vector-memory record stored in Qdrant.
@@ -303,4 +313,12 @@ pub enum FinishReason {
     Length,
     ContentFilter,
     Other(String),
+}
+
+/// Shared runtime metrics exposed by the HTTP `/status` endpoint.
+#[derive(Debug, Default)]
+pub struct RuntimeState {
+    pub started_at: DateTime<Utc>,
+    pub messages_received: std::sync::atomic::AtomicU64,
+    pub replies_sent: std::sync::atomic::AtomicU64,
 }

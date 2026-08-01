@@ -67,10 +67,17 @@ impl Egress for NapCatEgress {
         debug!("sending reply to group {}: {}", group_id, reply.content);
 
         let client = self.client().await?;
+        let mut segments = Vec::new();
+        if let Some(platform_id) = reply.reply_to_platform {
+            debug!("quoting message {platform_id}");
+            segments.push(MessageSegment::reply(platform_id));
+        }
+        segments.push(MessageSegment::text(&reply.content));
+
         client
             .api()
             .message
-            .send_group_message(group_id, vec![MessageSegment::text(&reply.content)])
+            .send_group_message(group_id, segments)
             .await
             .map_err(|e| NekoError::transport(format!("NapCat send failed: {e}")))?;
 

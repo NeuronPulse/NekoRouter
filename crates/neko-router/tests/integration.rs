@@ -61,6 +61,7 @@ impl Egress for MockEgress {
 fn make_message(content: &str) -> ChatMessage {
     ChatMessage {
         id: Uuid::new_v4(),
+        trace_id: Uuid::new_v4(),
         group_id: "12345".to_string(),
         sender: "67890".to_string(),
         nickname: "Alice".to_string(),
@@ -394,6 +395,7 @@ async fn detective_produces_correlated_report() {
             memory_top_k: 2,
             llm_temperature: 0.7,
             llm_max_tokens: 256,
+            fact_dedup_threshold: 0.92,
         },
         detective_llm,
         history,
@@ -543,10 +545,12 @@ async fn router_routes_reply_out_to_egress_sensory_and_sqlite() {
     let reply = ReplyOut {
         id: Uuid::new_v4(),
         reply_to: Uuid::new_v4(),
+        reply_to_platform: None,
         group_id: "12345".to_string(),
         target_user: "67890".to_string(),
         content: "喵".to_string(),
         layer: "gate".to_string(),
+        trace_id: Uuid::new_v4(),
     };
 
     neko_router::router::dispatch_event(
@@ -719,10 +723,12 @@ async fn router_applies_reply_cooldown() {
     let reply = || ReplyOut {
         id: Uuid::new_v4(),
         reply_to: Uuid::new_v4(),
+        reply_to_platform: None,
         group_id: "12345".to_string(),
         target_user: "67890".to_string(),
         content: "喵".to_string(),
         layer: "council".to_string(),
+        trace_id: Uuid::new_v4(),
     };
 
     // First reply is allowed; the second, within the interval, is suppressed.
@@ -747,6 +753,76 @@ async fn router_applies_reply_cooldown() {
         &detective_tx,
         &solidify_tx,
         Some(&cooldown),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(egress.sent.lock().await.len(), 1);
+    assert_eq!(sqlite.count_replies().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn router_persists_reply_cooldown_to_sqlite() {
+    let sqlite = SqliteStore::connect_in_memory().await.unwrap();
+    let store: Arc<dyn neko_core::CooldownStore> = Arc::new(sqlite.clone());
+    let egress = Arc::new(MockEgress::default());
+    let (sensory_tx, _sensory_rx) = mpsc::channel(16);
+    let (council_tx, _council_rx) = mpsc::channel(16);
+    let (detective_tx, _detective_rx) = mpsc::channel(16);
+    let (solidify_tx, _solidify_rx) = mpsc::channel(16);
+
+    let cooldown = ReplyCooldown::new_with_store(Duration::from_secs(60), store.clone())
+        .await
+        .unwrap();
+    let reply = ReplyOut {
+        id: Uuid::new_v4(),
+        reply_to: Uuid::new_v4(),
+        reply_to_platform: None,
+        group_id: "12345".to_string(),
+        target_user: "67890".to_string(),
+        content: "喵".to_string(),
+        layer: "council".to_string(),
+        trace_id: Uuid::new_v4(),
+    };
+
+    neko_router::router::dispatch_event(
+        Event::ReplyOut(reply),
+        egress.as_ref(),
+        &sqlite,
+        &sensory_tx,
+        &council_tx,
+        &detective_tx,
+        &solidify_tx,
+        Some(&cooldown),
+    )
+    .await
+    .unwrap();
+
+    // Wait for the async persistence task to finish.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // A fresh cooldown loads the persisted watermark and blocks the next reply.
+    let cooldown2 = ReplyCooldown::new_with_store(Duration::from_secs(60), store)
+        .await
+        .unwrap();
+    neko_router::router::dispatch_event(
+        Event::ReplyOut(ReplyOut {
+            id: Uuid::new_v4(),
+            reply_to: Uuid::new_v4(),
+            reply_to_platform: None,
+            group_id: "12345".to_string(),
+            target_user: "67890".to_string(),
+            content: "喵".to_string(),
+            layer: "council".to_string(),
+            trace_id: Uuid::new_v4(),
+        }),
+        egress.as_ref(),
+        &sqlite,
+        &sensory_tx,
+        &council_tx,
+        &detective_tx,
+        &solidify_tx,
+        Some(&cooldown2),
     )
     .await
     .unwrap();

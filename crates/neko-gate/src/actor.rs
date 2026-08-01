@@ -3,11 +3,11 @@ use dashmap::DashMap;
 use neko_core::{
     AffectiveState, ChatMessage, DropReason, EscalationReason, Event, FinishReason, GateDecision,
     GroupId, LlmClient, LlmMessage, LlmRequest, LlmRole, NekoError, ReplyOut, ResponseFormat,
-    UserId,
+    RuntimeState, UserId,
 };
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 /// Configuration for the gate layer.
 #[derive(Debug, Clone)]
@@ -43,10 +43,16 @@ pub struct GateActor<C: LlmClient> {
     semaphore: Arc<Semaphore>,
     states: DashMap<(GroupId, UserId), AffectiveState>,
     heuristic: Arc<dyn GateHeuristic>,
+    /// Optional shared runtime metrics, updated when messages enter the gate.
+    state: Option<Arc<RuntimeState>>,
 }
 
 impl<C: LlmClient + 'static> GateActor<C> {
     pub fn new(config: GateConfig, llm: C) -> Self {
+        Self::new_with_state(config, llm, None)
+    }
+
+    pub fn new_with_state(config: GateConfig, llm: C, state: Option<Arc<RuntimeState>>) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.concurrency_limit));
         let heuristic = Arc::from(heuristic_from_name(&config.heuristic));
         Self {
@@ -55,6 +61,7 @@ impl<C: LlmClient + 'static> GateActor<C> {
             semaphore,
             states: DashMap::new(),
             heuristic,
+            state,
         }
     }
 
@@ -68,6 +75,11 @@ impl<C: LlmClient + 'static> GateActor<C> {
         while let Some(event) = inbound.recv().await {
             match event {
                 Event::IncomingMessage(msg) => {
+                    if let Some(ref runtime) = self.state {
+                        runtime
+                            .messages_received
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let state = self
                         .states
                         .get(&(msg.group_id.clone(), msg.sender.clone()))
@@ -75,11 +87,15 @@ impl<C: LlmClient + 'static> GateActor<C> {
                         .unwrap_or_default();
                     let this = self.clone();
                     let out = out.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = this.handle_message(msg, state, out).await {
-                            warn!("gate handle error: {e}");
+                    let trace_id = msg.trace_id;
+                    tokio::spawn(
+                        async move {
+                            if let Err(e) = this.handle_message(msg, state, out).await {
+                                warn!("gate handle error: {e}");
+                            }
                         }
-                    });
+                        .instrument(info_span!("gate_handle", trace_id = %trace_id)),
+                    );
                 }
                 Event::AffectiveUpdated(group_id, user_id, state) => {
                     self.states.insert((group_id, user_id), state);
@@ -131,10 +147,12 @@ impl<C: LlmClient + 'static> GateActor<C> {
             out.send(Event::ReplyOut(ReplyOut {
                 id: uuid::Uuid::new_v4(),
                 reply_to: msg.id,
+                reply_to_platform: None,
                 group_id: msg.group_id.clone(),
                 target_user: msg.sender.clone(),
                 content: reply,
                 layer: "gate".to_string(),
+                trace_id: msg.trace_id,
             }))
             .await
             .map_err(|_| NekoError::transport("router channel closed"))?;
@@ -195,6 +213,7 @@ impl<C: LlmClient> Clone for GateActor<C> {
             semaphore: self.semaphore.clone(),
             states: self.states.clone(),
             heuristic: self.heuristic.clone(),
+            state: self.state.clone(),
         }
     }
 }

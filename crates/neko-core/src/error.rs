@@ -11,6 +11,8 @@ pub enum NekoError {
     Llm(String),
     /// Network / transport failure.
     Transport(String),
+    /// Transient failure that is safe to retry (network blip, 429, 5xx).
+    Transient(String),
     /// Message parsing failed.
     Parse(String),
     /// A requested resource or handler is missing.
@@ -26,6 +28,7 @@ impl fmt::Display for NekoError {
             NekoError::Database(msg) => write!(f, "database error: {msg}"),
             NekoError::Llm(msg) => write!(f, "llm error: {msg}"),
             NekoError::Transport(msg) => write!(f, "transport error: {msg}"),
+            NekoError::Transient(msg) => write!(f, "transient error: {msg}"),
             NekoError::Parse(msg) => write!(f, "parse error: {msg}"),
             NekoError::Missing(msg) => write!(f, "missing: {msg}"),
             NekoError::Other(msg) => write!(f, "{msg}"),
@@ -50,6 +53,10 @@ impl NekoError {
 
     pub fn transport<S: Into<String>>(msg: S) -> Self {
         NekoError::Transport(msg.into())
+    }
+
+    pub fn transient<S: Into<String>>(msg: S) -> Self {
+        NekoError::Transient(msg.into())
     }
 
     pub fn parse<S: Into<String>>(msg: S) -> Self {

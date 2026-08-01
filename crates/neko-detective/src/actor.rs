@@ -6,7 +6,7 @@ use neko_core::{
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 #[derive(Debug, Clone)]
 pub struct DetectiveConfig {
@@ -14,6 +14,9 @@ pub struct DetectiveConfig {
     pub memory_top_k: usize,
     pub llm_temperature: f32,
     pub llm_max_tokens: u32,
+    /// Minimum cosine similarity for a learned fact to be considered a
+    /// duplicate of an existing memory record and skipped.
+    pub fact_dedup_threshold: f32,
 }
 
 impl Default for DetectiveConfig {
@@ -23,6 +26,7 @@ impl Default for DetectiveConfig {
             memory_top_k: 5,
             llm_temperature: 0.7,
             llm_max_tokens: 1024,
+            fact_dedup_threshold: 0.92,
         }
     }
 }
@@ -62,11 +66,15 @@ impl<C: LlmClient + 'static> DetectiveActor<C> {
             if let Event::DetectiveRequest(req) = event {
                 let this = self.clone();
                 let out = out.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = this.handle_request(req, out).await {
-                        warn!("detective handle error: {e}");
+                let trace_id = req.message.trace_id;
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = this.handle_request(req, out).await {
+                            warn!("detective handle error: {e}");
+                        }
                     }
-                });
+                    .instrument(info_span!("detective_request", trace_id = %trace_id)),
+                );
             }
         }
 
@@ -128,6 +136,7 @@ impl<C: LlmClient + 'static> DetectiveActor<C> {
         // council can turn it into a final reply and solidify can persist it.
         let mut report = report;
         report.message_id = req.message.id;
+        report.trace_id = req.message.trace_id;
         report.group_id = req.message.group_id.clone();
         report.target_user = req.target_user.clone();
 
@@ -142,12 +151,38 @@ impl<C: LlmClient + 'static> DetectiveActor<C> {
     /// Write the report's historical facts into the vector store as memory
     /// records, closing the learning loop (facts from one investigation are
     /// retrieved by the next).
+    ///
+    /// Facts that are too similar to an existing memory record for the same
+    /// group are skipped to avoid duplicate entries.
     async fn persist_facts(&self, report: &DetectiveReport) {
-        let facts: Vec<neko_core::MemoryRecord> = report
+        let mut facts: Vec<neko_core::MemoryRecord> = Vec::new();
+
+        for f in report
             .historical_facts
             .iter()
             .filter(|f| !f.text.trim().is_empty())
-            .map(|f| neko_core::MemoryRecord {
+        {
+            match self
+                .vector_store
+                .search_with_score(&report.group_id, &f.text, 1)
+                .await
+            {
+                Ok(scored)
+                    if scored
+                        .first()
+                        .map(|(s, _)| *s >= self.config.fact_dedup_threshold)
+                        .unwrap_or(false) =>
+                {
+                    debug!("skipping duplicate fact: {}", f.text);
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("fact dedup search failed: {e}, persisting anyway");
+                }
+            }
+
+            facts.push(neko_core::MemoryRecord {
                 id: uuid::Uuid::new_v4().to_string(),
                 group_id: report.group_id.clone(),
                 speaker_id: report.target_user.clone(),
@@ -157,8 +192,8 @@ impl<C: LlmClient + 'static> DetectiveActor<C> {
                 relation_delta: None,
                 tags: vec!["fact".to_string(), "detective".to_string()],
                 layer: "detective".to_string(),
-            })
-            .collect();
+            });
+        }
 
         if facts.is_empty() {
             return;
@@ -185,11 +220,12 @@ impl<C: LlmClient> Clone for DetectiveActor<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::InMemoryVectorStore;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use neko_core::{
-        AffectiveState, ChatMessage, DetectiveInput, Event, FinishReason, HistoryStore, LlmClient,
-        LlmRequest, LlmResponse, MemoryRecord, TokenUsage, VectorStore,
+        AffectiveState, ChatMessage, DetectiveInput, Event, Fact, FinishReason, HistoryStore,
+        LlmClient, LlmRequest, LlmResponse, MemoryRecord, TokenUsage, VectorStore,
     };
     use std::sync::Mutex;
     use uuid::Uuid;
@@ -270,6 +306,7 @@ mod tests {
     fn make_message(content: &str) -> ChatMessage {
         ChatMessage {
             id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
             group_id: "12345".to_string(),
             sender: "67890".to_string(),
             nickname: "Alice".to_string(),
@@ -429,6 +466,70 @@ mod tests {
         assert_eq!(records[0].text, "用户养了一只叫咪咪的猫。");
         assert_eq!(records[0].speaker_id, "67890");
         assert!(records[0].tags.contains(&"fact".to_string()));
+    }
+
+    #[tokio::test]
+    async fn duplicate_facts_are_not_persisted_twice() {
+        let (tx, rx) = mpsc::channel(16);
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        vector_store
+            .embed_and_upsert(&[MemoryRecord {
+                id: Uuid::new_v4().to_string(),
+                group_id: "12345".to_string(),
+                speaker_id: "67890".to_string(),
+                target_id: None,
+                text: "用户养了一只叫咪咪的猫。".to_string(),
+                timestamp: Utc::now(),
+                relation_delta: None,
+                tags: vec!["fact".to_string()],
+                layer: "detective".to_string(),
+            }])
+            .await
+            .unwrap();
+
+        let report = DetectiveReport {
+            target_user: "67890".to_string(),
+            summary: "用户有宠物。".to_string(),
+            confidence: 0.9,
+            historical_facts: vec![Fact {
+                text: "用户养了一只叫咪咪的猫。".to_string(),
+                ..Default::default()
+            }],
+            recommended_tone: neko_core::Tone::Warm,
+            ..Default::default()
+        };
+        let llm = MockLlm::new(vec![serde_json::to_string(&report).unwrap()]);
+
+        let actor = DetectiveActor::new(
+            DetectiveConfig::default(),
+            llm,
+            Arc::new(MockHistory::default()),
+            vector_store.clone(),
+        );
+
+        tokio::spawn(async move {
+            let _ = actor.run(rx, out_tx).await;
+        });
+
+        tx.send(Event::DetectiveRequest(DetectiveInput {
+            message: make_message("你了解我吗？"),
+            state: AffectiveState::default(),
+            target_user: "67890".to_string(),
+        }))
+        .await
+        .unwrap();
+
+        let event = out_rx.recv().await.expect("expected detective report");
+        assert!(matches!(event, Event::DetectiveReport(_)));
+
+        // The duplicate fact is skipped, so the count stays at 1.
+        let records = vector_store
+            .search(&"12345".to_string(), "", 10)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
     }
 
     #[tokio::test]

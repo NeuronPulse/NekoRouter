@@ -62,6 +62,7 @@ mod tests {
     fn make_message(content: &str) -> ChatMessage {
         ChatMessage {
             id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
             group_id: "12345".to_string(),
             sender: "67890".to_string(),
             nickname: "Alice".to_string(),

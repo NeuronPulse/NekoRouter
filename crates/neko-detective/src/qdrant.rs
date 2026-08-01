@@ -116,6 +116,16 @@ impl VectorStore for QdrantVectorStore {
         query_text: &str,
         top_k: usize,
     ) -> Result<Vec<MemoryRecord>, NekoError> {
+        let scored = self.search_with_score(group_id, query_text, top_k).await?;
+        Ok(scored.into_iter().map(|(_, record)| record).collect())
+    }
+
+    async fn search_with_score(
+        &self,
+        group_id: &GroupId,
+        query_text: &str,
+        top_k: usize,
+    ) -> Result<Vec<(f32, MemoryRecord)>, NekoError> {
         self.ensure_collection().await?;
 
         let embedding = self.embedding.embed(&[query_text.to_string()]).await?;
@@ -143,7 +153,7 @@ impl VectorStore for QdrantVectorStore {
         for scored in result.result {
             let payload = Payload::from(scored.payload);
             match Self::payload_to_record(payload) {
-                Ok(record) => records.push(record),
+                Ok(record) => records.push((scored.score, record)),
                 Err(e) => debug!("skipping malformed Qdrant payload: {e}"),
             }
         }

@@ -58,6 +58,22 @@ pub trait HistoryStore: Send + Sync {
     }
 }
 
+/// Persistence backend for per-group reply cooldown watermarks.
+#[async_trait]
+pub trait CooldownStore: Send + Sync {
+    /// Load all persisted watermarks.
+    async fn load_cooldowns(
+        &self,
+    ) -> Result<std::collections::HashMap<GroupId, DateTime<Utc>>, NekoError>;
+
+    /// Persist a group's watermark.
+    async fn save_cooldown(
+        &self,
+        group_id: &GroupId,
+        watermark: DateTime<Utc>,
+    ) -> Result<(), NekoError>;
+}
+
 /// Vector memory store (Qdrant or similar).
 #[async_trait]
 pub trait VectorStore: Send + Sync {
@@ -69,6 +85,21 @@ pub trait VectorStore: Send + Sync {
         query_text: &str,
         top_k: usize,
     ) -> Result<Vec<MemoryRecord>, NekoError>;
+
+    /// Search for similar records and return them with a similarity score.
+    ///
+    /// Score semantics are implementation-defined; for cosine-based stores the
+    /// score is the cosine similarity (1.0 = identical, 0.0 = orthogonal).
+    /// The default implementation returns an empty list for stores that do not
+    /// support scoring.
+    async fn search_with_score(
+        &self,
+        _group_id: &GroupId,
+        _query_text: &str,
+        _top_k: usize,
+    ) -> Result<Vec<(f32, MemoryRecord)>, NekoError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Graph store (Neo4j or similar).
@@ -92,6 +123,12 @@ pub trait Ingress: Send + Sync {
         out: mpsc::Sender<crate::Event>,
         shutdown: watch::Receiver<bool>,
     ) -> Result<(), NekoError>;
+
+    /// Number of events dropped due to a full downstream channel.
+    /// Defaults to zero for ingresses that do not track drops.
+    fn drop_count(&self) -> u64 {
+        0
+    }
 }
 
 /// Egress adapter that sends replies back to the chat platform.

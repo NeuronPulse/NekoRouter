@@ -16,6 +16,7 @@ pub struct NekoConfig {
     pub llm: LlmConfig,
     pub personality: PersonalityConfig,
     pub solidify: SolidifyConfig,
+    pub status: StatusConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +109,22 @@ pub struct PersonalityConfig {
 pub struct SolidifyConfig {
     pub cron: String,
     pub timezone: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatusConfig {
+    #[serde(default = "default_status_host")]
+    pub host: String,
+    #[serde(default = "default_status_port")]
+    pub port: u16,
+}
+
+fn default_status_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_status_port() -> u16 {
+    3000
 }
 
 impl NekoConfig {

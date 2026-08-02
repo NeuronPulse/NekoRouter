@@ -5,6 +5,7 @@ use crate::types::{
 use crate::NekoError;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use tokio::sync::{mpsc, watch};
 
 /// Abstract LLM client. Implementations decide the transport and provider.
@@ -112,6 +113,53 @@ pub trait GraphStore: Send + Sync {
     /// memory. Defaults to an empty summary.
     async fn relationship_summary(&self, _limit: usize) -> Result<String, NekoError> {
         Ok(String::new())
+    }
+
+    /// Merge a relationship delta between two users.
+    ///
+    /// Default implementation builds a Cypher update and dispatches it through
+    /// [`apply_updates`]. Implementations may override it for more efficient
+    /// native upserts. The relation type is sanitized to `[A-Za-z_][A-Za-z0-9_]*`
+    /// before being interpolated into the Cypher string.
+    async fn merge_relation(
+        &self,
+        from: &UserId,
+        to: &UserId,
+        relation: &str,
+        delta: f32,
+        evidence: &str,
+    ) -> Result<(), NekoError> {
+        let sanitized: String = relation
+            .chars()
+            .enumerate()
+            .filter(|(i, c)| c.is_ascii_alphabetic() || *c == '_' || (*i > 0 && c.is_ascii_digit()))
+            .map(|(_, c)| c)
+            .collect();
+        let rel_type = if sanitized.is_empty() {
+            "REL".to_string()
+        } else {
+            sanitized
+        };
+
+        let cypher = format!(
+            "MERGE (a:User {{id: $from}}) \
+             MERGE (b:User {{id: $to}}) \
+             MERGE (a)-[r:{rel_type}]->(b) \
+             ON CREATE SET r.delta = $delta \
+             ON MATCH SET r.delta = coalesce(r.delta, 0) + $delta \
+             SET r.evidence = $evidence"
+        );
+
+        let mut params = HashMap::new();
+        params.insert("from".to_string(), serde_json::Value::String(from.clone()));
+        params.insert("to".to_string(), serde_json::Value::String(to.clone()));
+        params.insert("delta".to_string(), serde_json::json!(delta));
+        params.insert(
+            "evidence".to_string(),
+            serde_json::Value::String(evidence.to_string()),
+        );
+
+        self.apply_updates(&[GraphUpdate { cypher, params }]).await
     }
 }
 

@@ -17,6 +17,10 @@ pub struct NekoConfig {
     pub personality: PersonalityConfig,
     pub solidify: SolidifyConfig,
     pub status: StatusConfig,
+    #[serde(default)]
+    pub gate: GateConfig,
+    #[serde(default)]
+    pub burst: BurstConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,6 +116,101 @@ pub struct PersonalityConfig {
 pub struct SolidifyConfig {
     pub cron: String,
     pub timezone: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GateConfig {
+    #[serde(default = "default_gate_classifier")]
+    pub classifier: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default = "default_gate_context_messages")]
+    pub context_messages: usize,
+    #[serde(default = "default_gate_cache_ttl_sec")]
+    pub cache_ttl_sec: u64,
+    #[serde(default = "default_gate_rate_limit_per_min")]
+    pub rate_limit_per_min: u32,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            classifier: default_gate_classifier(),
+            provider: None,
+            context_messages: default_gate_context_messages(),
+            cache_ttl_sec: default_gate_cache_ttl_sec(),
+            rate_limit_per_min: default_gate_rate_limit_per_min(),
+        }
+    }
+}
+
+fn default_gate_classifier() -> String {
+    "default".to_string()
+}
+
+fn default_gate_context_messages() -> usize {
+    10
+}
+
+fn default_gate_cache_ttl_sec() -> u64 {
+    30
+}
+
+fn default_gate_rate_limit_per_min() -> u32 {
+    60
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BurstConfig {
+    #[serde(default = "default_burst_detection_enabled")]
+    pub detection_enabled: bool,
+    #[serde(default = "default_burst_window_sec")]
+    pub window_sec: u64,
+    #[serde(default = "default_burst_threshold_mpm")]
+    pub threshold_mpm: f32,
+    #[serde(default = "default_burst_threshold_participants")]
+    pub threshold_participants: usize,
+    #[serde(default = "default_burst_threshold_gap_sec")]
+    pub threshold_gap_sec: f32,
+    #[serde(default = "default_burst_cooldown_sec")]
+    pub cooldown_sec: u64,
+}
+
+impl Default for BurstConfig {
+    fn default() -> Self {
+        Self {
+            detection_enabled: default_burst_detection_enabled(),
+            window_sec: default_burst_window_sec(),
+            threshold_mpm: default_burst_threshold_mpm(),
+            threshold_participants: default_burst_threshold_participants(),
+            threshold_gap_sec: default_burst_threshold_gap_sec(),
+            cooldown_sec: default_burst_cooldown_sec(),
+        }
+    }
+}
+
+fn default_burst_detection_enabled() -> bool {
+    true
+}
+
+fn default_burst_window_sec() -> u64 {
+    60
+}
+
+fn default_burst_threshold_mpm() -> f32 {
+    6.0
+}
+
+fn default_burst_threshold_participants() -> usize {
+    3
+}
+
+fn default_burst_threshold_gap_sec() -> f32 {
+    30.0
+}
+
+fn default_burst_cooldown_sec() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Deserialize)]

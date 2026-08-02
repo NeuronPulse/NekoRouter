@@ -212,7 +212,8 @@ async fn gate_escalate_all_heuristic_sends_escalation() {
             max_message_length: 100,
             max_ambient_words: 10,
             concurrency_limit: 2,
-            heuristic: "escalate_all".to_string(),
+            classifier: "escalate_all".to_string(),
+            ..Default::default()
         },
         bot_identity(),
     );

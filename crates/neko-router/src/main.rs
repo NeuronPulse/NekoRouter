@@ -100,6 +100,12 @@ impl Router {
             energy_decay_per_min: self.config.personality.energy_decay_per_min,
             favor_decay_per_min: self.config.personality.favor_decay_per_min,
             max_recent_messages: 1024,
+            burst_detection_enabled: self.config.burst.detection_enabled,
+            burst_window_sec: self.config.burst.window_sec,
+            burst_threshold_mpm: self.config.burst.threshold_mpm,
+            burst_threshold_participants: self.config.burst.threshold_participants,
+            burst_threshold_gap_sec: self.config.burst.threshold_gap_sec,
+            burst_cooldown_sec: self.config.burst.cooldown_sec,
         };
         let sensory_actor =
             SensoryActor::new(sensory_config, self.sqlite.clone(), self.shutdown.clone());
@@ -109,15 +115,47 @@ impl Router {
             max_message_length: self.config.personality.max_message_length,
             max_ambient_words: self.config.personality.max_cozy_words,
             concurrency_limit: 8,
-            heuristic: "default".to_string(),
+            classifier: self.config.gate.classifier.clone(),
+            context_messages: self.config.gate.context_messages,
+            cache_ttl_sec: self.config.gate.cache_ttl_sec,
+            rate_limit_per_min: self.config.gate.rate_limit_per_min,
         };
         let bot_identity = BotIdentity {
             qq_id: self.config.bot.qq_id,
             name: self.config.bot.name.clone(),
             aliases: vec!["猫娘".to_string(), "机器人".to_string()],
         };
-        let gate_actor =
-            GateActor::new_with_state(gate_config, bot_identity, Some(runtime_state.clone()));
+        let gate_actor = if gate_config.classifier == "llm" {
+            let provider_name = self.config.gate.provider.as_deref().unwrap_or("gate");
+            let provider = self
+                .config
+                .llm
+                .providers
+                .get(provider_name)
+                .ok_or_else(|| {
+                    NekoError::config(format!("gate provider '{provider_name}' not found"))
+                })?;
+            let gate_llm = OpenAiCompatibleClient::new(
+                provider_name,
+                &provider.base_url,
+                &provider.model,
+                provider.api_key.clone(),
+                provider.temperature,
+                provider.max_tokens,
+                match provider.response_format {
+                    ResponseFormatConfig::Text => ResponseFormat::Text,
+                    ResponseFormatConfig::Json => ResponseFormat::JsonObject,
+                },
+            )?;
+            GateActor::new_with_llm(
+                gate_config,
+                bot_identity,
+                Arc::new(gate_llm),
+                Some(runtime_state.clone()),
+            )
+        } else {
+            GateActor::new_with_state(gate_config, bot_identity, Some(runtime_state.clone()))
+        };
 
         // Layer 3: council.
         let council_provider = self.config.council_provider()?;
@@ -291,20 +329,24 @@ impl Router {
                         }
                     }
                     Some(event) = router_rx.recv() => {
-                            if let Err(e) = neko_router::router::dispatch_event_with_state(
-                                event,
-                                egress.as_ref(),
-                                &sqlite_for_dispatcher,
-                                &sensory_routed_tx,
-                                &council_tx,
-                                &detective_tx,
-                                &solidify_tx,
-                                Some(&reply_cooldown),
-                                Some(&runtime_state),
-                            ).await {
-                                error!("dispatch error: {e}");
-                            }
+                        let vector_ref: Option<&dyn VectorStore> = Some(vector_store.as_ref());
+                        let graph_ref: Option<&dyn GraphStore> = Some(graph_store.as_ref());
+                        if let Err(e) = neko_router::router::dispatch_event_full(
+                            event,
+                            egress.as_ref(),
+                            &sqlite_for_dispatcher,
+                            vector_ref,
+                            graph_ref,
+                            &sensory_routed_tx,
+                            &council_tx,
+                            &detective_tx,
+                            &solidify_tx,
+                            Some(&reply_cooldown),
+                            Some(&runtime_state),
+                        ).await {
+                            error!("dispatch error: {e}");
                         }
+                    }
                 }
             }
         });

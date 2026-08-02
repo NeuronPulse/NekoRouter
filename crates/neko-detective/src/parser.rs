@@ -1,5 +1,6 @@
 use neko_core::{
-    DetectiveReport, Fact, NekoError, RelationKind, RelationshipChange, Tone, Weakness,
+    DetectiveReport, Fact, MemoryDecision, NekoError, RelationKind, RelationshipChange, Tone,
+    Weakness,
 };
 use serde::Deserialize;
 
@@ -110,6 +111,12 @@ fn parse_tone(s: &str) -> Tone {
         "cautious" => Tone::Cautious,
         _ => Tone::Neutral,
     }
+}
+
+pub fn parse_memory_decision(raw: &str) -> Result<MemoryDecision, NekoError> {
+    let cleaned = neko_llm::extract_json(raw).unwrap_or_else(|| raw.trim().to_string());
+    serde_json::from_str::<MemoryDecision>(&cleaned)
+        .map_err(|e| NekoError::parse(format!("cannot parse memory decision: {e}")))
 }
 
 #[cfg(test)]

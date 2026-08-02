@@ -80,6 +80,99 @@ pub enum EngagementType {
     AmbientJoin,
 }
 
+/// Score describing how "hot" a group conversation currently is.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct TopicBurstScore {
+    /// Estimated messages per minute in the observation window.
+    pub messages_per_minute: f32,
+    /// Number of distinct senders in the window.
+    pub unique_participants: usize,
+    /// Average gap between consecutive messages in seconds.
+    pub avg_gap_seconds: f32,
+    /// Optional semantic coherence of the window (0..1). Requires embeddings.
+    pub coherence: Option<f32>,
+}
+
+/// A detected topic burst in a group chat.
+///
+/// Produced by the sensory layer and consumed by the detective for background
+/// memory curation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicBurst {
+    pub group_id: GroupId,
+    pub messages: Vec<ChatMessage>,
+    pub score: TopicBurstScore,
+    pub detected_at: DateTime<Utc>,
+}
+
+/// A single memory update produced by the detective's memory-curator mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MemoryUpdate {
+    VectorFact(VectorFactUpdate),
+    VectorCulture(VectorCultureUpdate),
+    GraphRelation(GraphRelationUpdate),
+    AffectiveDelta(AffectiveDeltaUpdate),
+}
+
+/// Long-term fact about a user or the group, stored in the vector store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VectorFactUpdate {
+    pub content: String,
+    pub tags: Vec<String>,
+    pub related_users: Vec<UserId>,
+}
+
+/// Group culture item (meme, slang, norm), stored in the vector store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VectorCultureUpdate {
+    pub content: String,
+    pub tags: Vec<String>,
+    pub related_users: Vec<UserId>,
+}
+
+/// Relationship change between two users, stored in the graph store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GraphRelationUpdate {
+    pub from: UserId,
+    pub to: UserId,
+    pub relation: String,
+    pub delta: f32,
+    pub evidence: String,
+}
+
+/// Affective state change for a specific user, stored in SQLite.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AffectiveDeltaUpdate {
+    pub target_user: UserId,
+    pub energy_delta: f32,
+    pub favorability_delta: f32,
+    pub mood: Option<String>,
+    pub reason: String,
+}
+
+/// Structured decision produced by the detective about what to remember.
+///
+/// The detective LLM decides both *what* is worth remembering and *where* it
+/// belongs. The router dispatches each `MemoryUpdate` to the appropriate store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryDecision {
+    pub group_id: GroupId,
+    pub summary: String,
+    pub updates: Vec<MemoryUpdate>,
+}
+
+/// Result of the council's self-review of a candidate reply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplyReview {
+    pub reply_id: MessageId,
+    pub group_id: GroupId,
+    pub human_like_score: f32,
+    pub group_fit_score: f32,
+    pub red_flags: Vec<String>,
+    pub improved_reply: Option<String>,
+}
+
 /// Events flow between layers through bounded async channels.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -109,6 +202,10 @@ pub enum Event {
     /// Nightly graph summary produced by solidify, fed back to the council so
     /// long-term relationships influence future replies.
     DailyContext(String),
+    /// A group conversation has heated up around a topic.
+    TopicBurst(TopicBurst),
+    /// A structured decision about where to store new insights.
+    MemoryDecision(MemoryDecision),
 }
 
 /// Reasons for dropping or escalating a message.

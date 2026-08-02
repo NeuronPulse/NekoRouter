@@ -248,6 +248,33 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Apply an affective delta to a user's persisted state, clamping values to
+    /// their valid ranges.
+    pub async fn apply_affective_delta(
+        &self,
+        group_id: &GroupId,
+        user_id: &UserId,
+        energy_delta: f32,
+        favorability_delta: f32,
+        mood: Option<&str>,
+    ) -> Result<(), NekoError> {
+        let mut state = self
+            .load_affective_states()
+            .await?
+            .into_iter()
+            .find(|(g, u, _)| g == group_id && u == user_id)
+            .map(|(_, _, s)| s)
+            .unwrap_or_default();
+
+        state.energy = (state.energy + energy_delta).clamp(0.0, 1.0);
+        state.favorability = (state.favorability + favorability_delta).clamp(-1.0, 1.0);
+        state.last_updated = Some(Utc::now());
+        let _ = mood; // reserved for future schema extension
+
+        self.save_affective_states(&[(group_id.clone(), user_id.clone(), state)])
+            .await
+    }
+
     /// Number of persisted replies (used for tests and observability).
     pub async fn count_replies(&self) -> Result<i64, NekoError> {
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM replies")

@@ -1,4 +1,4 @@
-use neko_core::{ChatMessage, DetectiveInput, MemoryRecord};
+use neko_core::{ChatMessage, DetectiveInput, MemoryRecord, TopicBurst};
 
 /// Build the detective prompt that asks for a dehydrated JSON case report.
 pub fn detective_prompt(
@@ -49,6 +49,55 @@ pub fn detective_prompt(
         input.state.favorability,
         history_text,
         input.target_user,
+    )
+}
+
+/// Build the prompt for the detective's memory-curator mode.
+///
+/// Given a hot conversation window, the model decides what is worth remembering
+/// and where each insight belongs (vector facts, vector culture, graph
+/// relations, affective deltas).
+pub fn memory_curator_prompt(burst: &TopicBurst) -> String {
+    let messages_text = burst
+        .messages
+        .iter()
+        .map(|m| {
+            format!(
+                "{} [{}]: {}",
+                m.timestamp.format("%H:%M"),
+                m.nickname,
+                m.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "你是一位群聊记忆管理员。请分析下面这段突然热起来的对话，并决定哪些信息值得长期保存。\n\
+         \n\
+         请只输出 JSON，顶层结构为：\n\
+         {{\n\
+           \"group_id\": \"{group_id}\",\n\
+           \"summary\": \"这段对话的整体摘要\",\n\
+           \"updates\": [\n\
+             {{\"kind\": \"vector_fact\", \"content\": \"...\", \"tags\": [\"tag\"], \"related_users\": [\"user_id\"]}},\n\
+             {{\"kind\": \"vector_culture\", \"content\": \"...\", \"tags\": [\"meme\"], \"related_users\": []}},\n\
+             {{\"kind\": \"graph_relation\", \"from\": \"u1\", \"to\": \"u2\", \"relation\": \"互怼\", \"delta\": -0.2, \"evidence\": \"...\"}},\n\
+             {{\"kind\": \"affective_delta\", \"target_user\": \"u1\", \"energy_delta\": 0.0, \"favorability_delta\": 0.1, \"mood\": null, \"reason\": \"...\"}}\n\
+           ]\n\
+         }}\n\
+         \n\
+         原则：\n\
+         1. 只记录以后可能用得上的信息，避免噪音。\n\
+         2. 区分个人事实（vector_fact）和群文化/梗（vector_culture）。\n\
+         3. 当梗或文化与某个人相关时，把TA放进 related_users。\n\
+         4. 关系变化（graph_relation）可以是友好、对立、调侃、默契等。\n\
+         5. 情感变化（affective_delta）幅度要小（-0.3 到 +0.3），除非事件特别强烈。\n\
+         6. 没有值得记录的内容时，updates 可以为空。\n\
+         \n\
+         对话记录：\n{messages}",
+        group_id = burst.group_id,
+        messages = messages_text,
     )
 }
 

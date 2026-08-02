@@ -71,3 +71,18 @@ timezone = "Asia/Shanghai"
 [status]
 host = "127.0.0.1"
 port = 3000
+
+[gate]
+classifier = "default"        # "default" | "llm" | "escalate_all"
+provider = "deepseek"         # provider name from [llm.providers] when classifier = "llm"
+context_messages = 10
+cache_ttl_sec = 30
+rate_limit_per_min = 60
+
+[burst]
+detection_enabled = true
+window_sec = 60
+threshold_mpm = 6.0
+threshold_participants = 3
+threshold_gap_sec = 30.0
+cooldown_sec = 120

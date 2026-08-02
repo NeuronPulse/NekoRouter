@@ -1,8 +1,10 @@
-use crate::heuristic::{heuristic_from_name, BotIdentity, GateClassification, GateHeuristic};
+use crate::heuristic::{
+    classifier_from_name, BotIdentity, GateClassification, GateClassifier, LlmGateClassifier,
+};
 use dashmap::DashMap;
 use neko_core::{
-    AffectiveState, ChatMessage, EngagementType, Event, GateDecision, GroupId, NekoError,
-    RuntimeState, UserId,
+    AffectiveState, ChatMessage, Event, GateDecision, GroupId, LlmClient, NekoError, RuntimeState,
+    UserId,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -19,11 +21,17 @@ pub struct GateConfig {
     pub max_ambient_words: usize,
     /// Maximum concurrent classification tasks.
     pub concurrency_limit: usize,
-    /// Name of the heuristic strategy to use. Built-in names:
-    /// - `"default"`: classify commands/URLs/long messages as drop, directed
-    ///   messages as personal replies, short chitchat as ambient joins.
+    /// Classifier strategy to use. Built-in names:
+    /// - `"default"`: fast heuristic classifier.
+    /// - `"llm"`: cheap LLM classifier (requires `llm_client`).
     /// - `"escalate_all"`: always escalate as personal reply (testing stub).
-    pub heuristic: String,
+    pub classifier: String,
+    /// Number of recent messages to include in the LLM prompt context.
+    pub context_messages: usize,
+    /// TTL in seconds for cached classification results.
+    pub cache_ttl_sec: u64,
+    /// Maximum classifications per minute per group.
+    pub rate_limit_per_min: u32,
 }
 
 impl Default for GateConfig {
@@ -32,12 +40,15 @@ impl Default for GateConfig {
             max_message_length: 800,
             max_ambient_words: 10,
             concurrency_limit: 8,
-            heuristic: "default".to_string(),
+            classifier: "default".to_string(),
+            context_messages: 10,
+            cache_ttl_sec: 30,
+            rate_limit_per_min: 60,
         }
     }
 }
 
-/// Layer 2 actor: fast heuristic gate.
+/// Layer 2 actor: engagement classifier gate.
 ///
 /// The gate no longer generates replies. Its only job is to decide whether the
 /// bot should engage and, if so, whether the message is a personal reply or an
@@ -46,7 +57,9 @@ pub struct GateActor {
     config: GateConfig,
     self_id: BotIdentity,
     states: DashMap<(GroupId, UserId), AffectiveState>,
-    heuristic: Arc<dyn GateHeuristic>,
+    classifier: Arc<dyn GateClassifier>,
+    /// Recent messages per group, used as LLM context.
+    recent_context: DashMap<GroupId, Vec<ChatMessage>>,
     /// Optional shared runtime metrics, updated when messages enter the gate.
     state: Option<Arc<RuntimeState>>,
 }
@@ -61,12 +74,35 @@ impl GateActor {
         self_id: BotIdentity,
         state: Option<Arc<RuntimeState>>,
     ) -> Self {
-        let heuristic = Arc::from(heuristic_from_name(&config.heuristic));
+        let classifier = Arc::from(classifier_from_name(&config.classifier));
         Self {
             config,
             self_id,
             states: DashMap::new(),
-            heuristic,
+            classifier,
+            recent_context: DashMap::new(),
+            state,
+        }
+    }
+
+    /// Build a gate actor with an LLM classifier.
+    pub fn new_with_llm(
+        config: GateConfig,
+        self_id: BotIdentity,
+        llm_client: Arc<dyn LlmClient>,
+        state: Option<Arc<RuntimeState>>,
+    ) -> Self {
+        let classifier: Arc<dyn GateClassifier> = if config.classifier == "llm" {
+            Arc::new(LlmGateClassifier::new(llm_client))
+        } else {
+            Arc::from(classifier_from_name(&config.classifier))
+        };
+        Self {
+            config,
+            self_id,
+            states: DashMap::new(),
+            classifier,
+            recent_context: DashMap::new(),
             state,
         }
     }
@@ -122,12 +158,26 @@ impl GateActor {
     ) -> Result<(), NekoError> {
         debug!("gate processing message from {}", msg.sender);
 
-        let classification = self.heuristic.classify(&msg, &self.config, &self.self_id);
+        // Maintain a rolling window of recent messages for context-aware
+        // classifiers.
+        let recent_context = {
+            let mut entry = self.recent_context.entry(msg.group_id.clone()).or_default();
+            entry.push(msg.clone());
+            if entry.len() > self.config.context_messages {
+                entry.remove(0);
+            }
+            entry.value().clone()
+        };
+
+        let classification = self
+            .classifier
+            .classify(&msg, &recent_context, &state, &self.config, &self.self_id)
+            .await?;
 
         let decision = match classification {
             GateClassification::Drop(reason) => GateDecision::Drop(reason),
             GateClassification::Escalate(engagement_type) => {
-                GateDecision::Escalate(reason_for(&msg, engagement_type), engagement_type)
+                GateDecision::Escalate(neko_core::EscalationReason::NeedsContext, engagement_type)
             }
         };
 
@@ -148,18 +198,14 @@ impl GateActor {
     }
 }
 
-/// Map an engagement classification to a human-readable escalation reason.
-fn reason_for(_msg: &ChatMessage, _engagement_type: EngagementType) -> neko_core::EscalationReason {
-    neko_core::EscalationReason::NeedsContext
-}
-
 impl Clone for GateActor {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
             self_id: self.self_id.clone(),
             states: self.states.clone(),
-            heuristic: self.heuristic.clone(),
+            classifier: self.classifier.clone(),
+            recent_context: self.recent_context.clone(),
             state: self.state.clone(),
         }
     }

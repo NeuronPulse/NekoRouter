@@ -9,6 +9,7 @@ repository.workspace = true
 description = "Layer 2: cheap model gate for NekoRouter"
 
 [dependencies]
+async-trait = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 neko-config = { workspace = true }

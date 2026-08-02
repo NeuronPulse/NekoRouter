@@ -2,7 +2,7 @@ use crate::{parser, prompt};
 use chrono::Utc;
 use neko_core::{
     DetectiveInput, DetectiveReport, Event, HistoryStore, LlmClient, LlmMessage, LlmRequest,
-    LlmRole, NekoError, ResponseFormat, VectorStore,
+    LlmRole, MemoryDecision, NekoError, ResponseFormat, TopicBurst, VectorStore,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -63,18 +63,30 @@ impl<C: LlmClient + 'static> DetectiveActor<C> {
         info!("detective actor started");
 
         while let Some(event) = inbound.recv().await {
-            if let Event::DetectiveRequest(req) = event {
-                let this = self.clone();
-                let out = out.clone();
-                let trace_id = req.message.trace_id;
-                tokio::spawn(
-                    async move {
-                        if let Err(e) = this.handle_request(req, out).await {
-                            warn!("detective handle error: {e}");
+            match event {
+                Event::DetectiveRequest(req) => {
+                    let this = self.clone();
+                    let out = out.clone();
+                    let trace_id = req.message.trace_id;
+                    tokio::spawn(
+                        async move {
+                            if let Err(e) = this.handle_request(req, out).await {
+                                warn!("detective handle error: {e}");
+                            }
                         }
-                    }
-                    .instrument(info_span!("detective_request", trace_id = %trace_id)),
-                );
+                        .instrument(info_span!("detective_request", trace_id = %trace_id)),
+                    );
+                }
+                Event::TopicBurst(burst) => {
+                    let this = self.clone();
+                    let out = out.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = this.handle_burst(burst, out).await {
+                            warn!("detective burst handle error: {e}");
+                        }
+                    });
+                }
+                _ => {}
             }
         }
 
@@ -203,6 +215,64 @@ impl<C: LlmClient + 'static> DetectiveActor<C> {
             Ok(()) => debug!("persisted {} learned facts", facts.len()),
             Err(e) => warn!("failed to persist learned facts: {e}"),
         }
+    }
+
+    /// Analyze a hot conversation window and produce a structured memory decision.
+    async fn handle_burst(
+        &self,
+        burst: TopicBurst,
+        out: mpsc::Sender<Event>,
+    ) -> Result<(), NekoError> {
+        debug!(
+            "detective curating memory for group {} ({} messages, {:.1} mpm)",
+            burst.group_id,
+            burst.messages.len(),
+            burst.score.messages_per_minute
+        );
+
+        let prompt = prompt::memory_curator_prompt(&burst);
+        let llm_req = LlmRequest {
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: prompt,
+            }],
+            temperature: self.config.llm_temperature,
+            max_tokens: Some(self.config.llm_max_tokens),
+            response_format: Some(ResponseFormat::JsonObject),
+        };
+
+        let decision = match self.llm.complete(llm_req).await {
+            Ok(resp) => match parser::parse_memory_decision(&resp.content) {
+                Ok(mut d) => {
+                    d.group_id = burst.group_id;
+                    d
+                }
+                Err(e) => {
+                    warn!("detective failed to parse memory decision: {e}");
+                    MemoryDecision {
+                        group_id: burst.group_id,
+                        summary: String::new(),
+                        updates: vec![],
+                    }
+                }
+            },
+            Err(e) => {
+                warn!("detective llm failed during burst curation: {e}");
+                MemoryDecision {
+                    group_id: burst.group_id,
+                    summary: String::new(),
+                    updates: vec![],
+                }
+            }
+        };
+
+        if !decision.updates.is_empty() {
+            out.send(Event::MemoryDecision(decision))
+                .await
+                .map_err(|_| NekoError::transport("router channel closed"))?;
+        }
+
+        Ok(())
     }
 }
 

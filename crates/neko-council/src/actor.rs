@@ -81,13 +81,13 @@ impl<C: LlmClient + 'static> CouncilActor<C> {
                 event = inbound.recv() => {
                     let Some(event) = event else { break };
                     match event {
-                        Event::Escalation(_, msg, state) => {
+                        Event::Escalation(_, msg, state, engagement_type) => {
                             let this = self.clone();
                             let out = out.clone();
                             let trace_id = msg.trace_id;
                             tokio::spawn(
                                 async move {
-                                    if let Err(e) = this.handle_escalation(msg, state, out).await {
+                                    if let Err(e) = this.handle_escalation(msg, state, engagement_type, out).await {
                                         warn!("council handle error: {e}");
                                     }
                                 }
@@ -157,15 +157,23 @@ impl<C: LlmClient + 'static> CouncilActor<C> {
         &self,
         msg: neko_core::ChatMessage,
         state: neko_core::AffectiveState,
+        engagement_type: neko_core::EngagementType,
         out: mpsc::Sender<Event>,
     ) -> Result<(), NekoError> {
-        debug!("council processing escalation from {}", msg.sender);
+        debug!(
+            "council processing escalation from {} ({:?})",
+            msg.sender, engagement_type
+        );
 
+        let user_filter = match engagement_type {
+            neko_core::EngagementType::PersonalReply => Some(&msg.sender),
+            neko_core::EngagementType::AmbientJoin => None,
+        };
         let context = self
             .history_store
             .query_context(
                 &msg.group_id,
-                Some(&msg.sender),
+                user_filter,
                 Utc::now(),
                 self.config.context_limit,
             )
@@ -182,6 +190,7 @@ impl<C: LlmClient + 'static> CouncilActor<C> {
                 .unwrap()
                 .clone()
                 .unwrap_or_default(),
+            engagement_type,
         };
 
         let council_prompt = prompt::council_prompt(&input, &input.context);
@@ -324,8 +333,9 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use neko_core::{
-        AffectiveState, ChatMessage, CouncilAction, DetectiveInput, EscalationReason, Event,
-        FinishReason, LlmClient, LlmRequest, LlmResponse, ReplyOut, TokenUsage,
+        AffectiveState, ChatMessage, CouncilAction, DetectiveInput, EngagementType,
+        EscalationReason, Event, FinishReason, LlmClient, LlmRequest, LlmResponse, ReplyOut,
+        TokenUsage,
     };
     use std::sync::Mutex;
     use uuid::Uuid;
@@ -420,6 +430,7 @@ mod tests {
                 EscalationReason::NeedsContext,
                 make_message("在吗"),
                 AffectiveState::default(),
+                EngagementType::PersonalReply,
             ))
             .await
             .unwrap();
@@ -469,6 +480,7 @@ mod tests {
                 EscalationReason::NeedsContext,
                 msg,
                 AffectiveState::default(),
+                EngagementType::PersonalReply,
             ))
             .await
             .unwrap();
@@ -510,6 +522,7 @@ mod tests {
                 EscalationReason::Other("spam".to_string()),
                 make_message("广告"),
                 AffectiveState::default(),
+                EngagementType::PersonalReply,
             ))
             .await
             .unwrap();
@@ -545,6 +558,7 @@ mod tests {
                 EscalationReason::NeedsContext,
                 make_message("??"),
                 AffectiveState::default(),
+                EngagementType::PersonalReply,
             ))
             .await
             .unwrap();
@@ -581,6 +595,7 @@ mod tests {
                 EscalationReason::NeedsContext,
                 msg,
                 AffectiveState::default(),
+                EngagementType::PersonalReply,
             ))
             .await
             .unwrap();
@@ -657,6 +672,7 @@ mod tests {
                 EscalationReason::NeedsContext,
                 msg,
                 AffectiveState::default(),
+                EngagementType::PersonalReply,
             ))
             .await
             .unwrap();
@@ -718,6 +734,7 @@ mod tests {
                 EscalationReason::NeedsContext,
                 msg,
                 AffectiveState::default(),
+                EngagementType::PersonalReply,
             ))
             .await
             .unwrap();
@@ -787,6 +804,7 @@ mod tests {
                 EscalationReason::NeedsContext,
                 make_message("在吗"),
                 AffectiveState::default(),
+                EngagementType::PersonalReply,
             ))
             .await
             .unwrap();

@@ -4,7 +4,7 @@ use neko_core::{
     RuntimeState, VectorStore,
 };
 use neko_detective::{DetectiveActor, DetectiveConfig, InMemoryVectorStore, QdrantVectorStore};
-use neko_gate::{GateActor, GateConfig};
+use neko_gate::{BotIdentity, GateActor, GateConfig};
 use neko_llm::{OpenAiCompatibleClient, OpenAiEmbeddingClient};
 use neko_memory::SqliteStore;
 use neko_sensory::{NapCatEgress, NapCatIngress, SensoryActor, SensoryConfig};
@@ -105,29 +105,19 @@ impl Router {
             SensoryActor::new(sensory_config, self.sqlite.clone(), self.shutdown.clone());
 
         // Layer 2: gate.
-        let gate_provider = self.config.gate_provider()?;
-        let gate_llm = OpenAiCompatibleClient::new(
-            &self.config.llm.gate,
-            &gate_provider.base_url,
-            &gate_provider.model,
-            gate_provider.api_key.clone(),
-            gate_provider.temperature,
-            gate_provider.max_tokens,
-            match gate_provider.response_format {
-                ResponseFormatConfig::Text => ResponseFormat::Text,
-                ResponseFormatConfig::Json => ResponseFormat::JsonObject,
-            },
-        )?;
         let gate_config = GateConfig {
             max_message_length: self.config.personality.max_message_length,
-            max_cozy_words: self.config.personality.max_cozy_words,
-            llm_temperature: gate_provider.temperature,
-            llm_max_tokens: gate_provider.max_tokens.unwrap_or(32),
+            max_ambient_words: self.config.personality.max_cozy_words,
             concurrency_limit: 8,
             heuristic: "default".to_string(),
         };
+        let bot_identity = BotIdentity {
+            qq_id: self.config.bot.qq_id,
+            name: self.config.bot.name.clone(),
+            aliases: vec!["猫娘".to_string(), "机器人".to_string()],
+        };
         let gate_actor =
-            GateActor::new_with_state(gate_config, gate_llm, Some(runtime_state.clone()));
+            GateActor::new_with_state(gate_config, bot_identity, Some(runtime_state.clone()));
 
         // Layer 3: council.
         let council_provider = self.config.council_provider()?;

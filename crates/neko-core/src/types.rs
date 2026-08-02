@@ -69,6 +69,17 @@ impl AffectiveState {
     }
 }
 
+/// Engagement type decided by the gate: how the bot should participate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EngagementType {
+    /// Someone is directly addressing the bot; reply with full context/memory.
+    #[default]
+    PersonalReply,
+    /// The bot is joining an ambient group discussion; keep it brief and
+    /// unobtrusive.
+    AmbientJoin,
+}
+
 /// Events flow between layers through bounded async channels.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -79,7 +90,12 @@ pub enum Event {
     /// Layer 2 produced a decision.
     GateDecision(GateDecision),
     /// Layer 2 decided this message needs council attention.
-    Escalation(EscalationReason, ChatMessage, AffectiveState),
+    Escalation(
+        EscalationReason,
+        ChatMessage,
+        AffectiveState,
+        EngagementType,
+    ),
     /// Layer 3 output.
     CouncilDecision(CouncilDecision),
     /// Layer 4 input.
@@ -118,10 +134,8 @@ pub enum EscalationReason {
 pub enum GateDecision {
     /// Drop the message without reply.
     Drop(DropReason),
-    /// Reply with a short cozy sentence (<= 10 Chinese words / tokens).
-    CozyReply(String),
-    /// Escalate to the council layer.
-    Escalate(EscalationReason),
+    /// Escalate to the council layer, specifying how the bot should engage.
+    Escalate(EscalationReason, EngagementType),
 }
 
 /// Input to the council layer.
@@ -133,6 +147,8 @@ pub struct CouncilInput {
     /// Nightly graph summary (from solidify), empty when none has been
     /// produced yet.
     pub daily_context: String,
+    /// Whether this is a personal reply or an ambient group join.
+    pub engagement_type: EngagementType,
 }
 
 /// Decision made by the council layer.

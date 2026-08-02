@@ -1632,12 +1632,10 @@ dependencies = [
 name = "neko-gate"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "chrono",
  "dashmap",
  "neko-config",
  "neko-core",
- "neko-llm",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

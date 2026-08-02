@@ -64,7 +64,10 @@ pub struct Neo4jConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmConfig {
-    pub gate: String,
+    /// Deprecated: the gate no longer uses an LLM. Kept for backward
+    /// compatibility but not required.
+    #[serde(default)]
+    pub gate: Option<String>,
     pub council: String,
     /// Optional provider for the detective layer; falls back to `council`.
     #[serde(default)]
@@ -198,7 +201,6 @@ impl NekoConfig {
             return Err(NekoError::config("sqlite.path is required"));
         }
 
-        self.gate_provider()?;
         self.council_provider()?;
         self.detective_provider()?;
         self.solidify_provider()?;
@@ -243,9 +245,11 @@ impl NekoConfig {
     }
 
     pub fn gate_provider(&self) -> Result<&LlmProviderConfig, NekoError> {
-        self.llm.providers.get(&self.llm.gate).ok_or_else(|| {
-            NekoError::config(format!("gate provider '{}' not found", self.llm.gate))
-        })
+        let name = self.llm.gate.as_deref().unwrap_or("gate");
+        self.llm
+            .providers
+            .get(name)
+            .ok_or_else(|| NekoError::config(format!("gate provider '{name}' not found")))
     }
 
     pub fn council_provider(&self) -> Result<&LlmProviderConfig, NekoError> {

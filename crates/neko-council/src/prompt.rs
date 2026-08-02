@@ -1,4 +1,4 @@
-use neko_core::{ChatMessage, CouncilInput};
+use neko_core::{ChatMessage, CouncilInput, EngagementType};
 
 /// Build the Mind Council debate prompt.
 ///
@@ -30,6 +30,15 @@ pub fn council_prompt(input: &CouncilInput, context: &[ChatMessage]) -> String {
         format!("当前长期关系记忆：\n{}\n\n", input.daily_context.trim())
     };
 
+    let engagement_instruction = match input.engagement_type {
+        EngagementType::PersonalReply => {
+            "用户正在直接与你对话。请认真回复，充分利用历史上下文和长期记忆，保持人设一致。"
+        }
+        EngagementType::AmbientJoin => {
+            "这是群聊中的 ambient 插话。请简短、俏皮、不要抢戏。如果不值得接话或会破坏氛围，选择 ignore。"
+        }
+    };
+
     format!(
         "你是一座赛博猫娘心智议会中的首席路由官。现在需要决定如何回复 QQ 群里的这条消息。\n\
          \n\
@@ -40,6 +49,8 @@ pub fn council_prompt(input: &CouncilInput, context: &[ChatMessage]) -> String {
          \n\
          {daily_block}\
          近期历史上下文：\n{}\n\
+         \n\
+         介入类型说明：{}\n\
          \n\
          议会中有三个角色在辩论：\n\
          1. 【猫系本能】：凭直觉、情绪、猫娘本能反应。\n\
@@ -54,7 +65,7 @@ pub fn council_prompt(input: &CouncilInput, context: &[ChatMessage]) -> String {
          }}\n\
          \n\
          注意：回复内容不要超过 50 字。",
-        user_nick, content, energy, favor, context_text
+        user_nick, content, energy, favor, context_text, engagement_instruction
     )
 }
 
@@ -89,6 +100,7 @@ mod tests {
             },
             context,
             daily_context: String::new(),
+            engagement_type: EngagementType::PersonalReply,
         }
     }
 
@@ -131,5 +143,14 @@ mod tests {
         let input = input_with_context(vec![]);
         let prompt = council_prompt(&input, &input.context);
         assert!(prompt.contains("\"action\": \"reply\" | \"detective\" | \"ignore\""));
+    }
+
+    #[test]
+    fn ambient_join_prompt_asks_for_brief_join() {
+        let mut input = input_with_context(vec![]);
+        input.engagement_type = EngagementType::AmbientJoin;
+        let prompt = council_prompt(&input, &input.context);
+        assert!(prompt.contains("ambient 插话"));
+        assert!(prompt.contains("不要抢戏"));
     }
 }

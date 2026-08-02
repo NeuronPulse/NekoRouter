@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use neko_core::{
-    AffectiveState, ChatMessage, DetectiveInput, DetectiveReport, Egress, Event, FinishReason,
-    HistoryStore, LlmClient, LlmRequest, LlmResponse, NekoError, ReplyCooldown, ReplyOut,
-    TokenUsage,
+    AffectiveState, ChatMessage, DetectiveInput, DetectiveReport, Egress, EngagementType, Event,
+    FinishReason, HistoryStore, LlmClient, LlmRequest, LlmResponse, NekoError, ReplyCooldown,
+    ReplyOut, TokenUsage,
 };
-use neko_gate::{GateActor, GateConfig};
+use neko_gate::{BotIdentity, GateActor, GateConfig};
 use neko_memory::SqliteStore;
 use neko_sensory::{SensoryActor, SensoryConfig};
 use neko_solidify::{InMemoryGraphStore, SolidifyActor, SolidifyConfig};
@@ -72,10 +72,20 @@ fn make_message(content: &str) -> ChatMessage {
     }
 }
 
+fn bot_identity() -> BotIdentity {
+    BotIdentity {
+        qq_id: 123456789,
+        name: "NekoRouter".to_string(),
+        aliases: vec!["猫娘".to_string(), "机器人".to_string()],
+    }
+}
+
 /// Spawn a tiny pipeline: sensory actor -> gate actor.
+///
+/// The gate no longer generates replies; it emits `GateDecision` and
+/// `Escalation` events. Tests can assert on those directly.
 async fn spawn_pipeline(
     sqlite: SqliteStore,
-    llm_responses: Vec<String>,
 ) -> (
     mpsc::Sender<Event>,
     mpsc::Receiver<Event>,
@@ -100,13 +110,11 @@ async fn spawn_pipeline(
     let gate = GateActor::new(
         GateConfig {
             max_message_length: 100,
-            max_cozy_words: 10,
-            llm_temperature: 0.7,
-            llm_max_tokens: 32,
+            max_ambient_words: 10,
             concurrency_limit: 2,
             ..Default::default()
         },
-        MockLlmClient::new(llm_responses),
+        bot_identity(),
     );
 
     tokio::spawn(async move {
@@ -117,11 +125,8 @@ async fn spawn_pipeline(
         let _ = gate.run(gate_rx, out_tx).await;
     });
 
-    // Forward ReplyOut events back to the sensory actor so it can update
-    // affective state.
+    // Keep the routed channel alive so sensory sends do not fail.
     tokio::spawn(async move {
-        // The test does not need to observe routed events after this point,
-        // but keeping the channel alive prevents send errors.
         let _ = routed_tx;
     });
 
@@ -129,17 +134,16 @@ async fn spawn_pipeline(
 }
 
 #[tokio::test]
-async fn gate_replies_to_short_message_and_persists_history() {
+async fn gate_escalates_short_message_and_persists_history() {
     let sqlite = SqliteStore::connect_in_memory().await.unwrap();
-    let (raw_tx, mut out_rx, shutdown_tx) =
-        spawn_pipeline(sqlite.clone(), vec!["喵~".to_string()]).await;
+    let (raw_tx, mut out_rx, shutdown_tx) = spawn_pipeline(sqlite.clone()).await;
 
     raw_tx
         .send(Event::IncomingMessage(make_message("你好")))
         .await
         .unwrap();
 
-    // The gate emits a decision first, then the actual reply.
+    // The gate emits a decision first, then escalates to the council.
     let decision = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
         .await
         .expect("timeout waiting for gate decision")
@@ -151,15 +155,12 @@ async fn gate_replies_to_short_message_and_persists_history() {
 
     let event = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
         .await
-        .expect("timeout waiting for gate reply")
+        .expect("timeout waiting for gate escalation")
         .expect("gate channel closed");
-
-    match event {
-        Event::ReplyOut(ReplyOut { content, .. }) => {
-            assert_eq!(content, "喵~");
-        }
-        other => panic!("expected ReplyOut, got {other:?}"),
-    }
+    assert!(
+        matches!(event, Event::Escalation(_, _, _, _)),
+        "expected Escalation, got {event:?}"
+    );
 
     // Shutdown sensory actor and give it time to flush.
     let _ = shutdown_tx.send(true);
@@ -176,7 +177,7 @@ async fn gate_replies_to_short_message_and_persists_history() {
 #[tokio::test]
 async fn gate_drops_too_long_message() {
     let sqlite = SqliteStore::connect_in_memory().await.unwrap();
-    let (raw_tx, mut out_rx, shutdown_tx) = spawn_pipeline(sqlite.clone(), vec![]).await;
+    let (raw_tx, mut out_rx, shutdown_tx) = spawn_pipeline(sqlite.clone()).await;
 
     let long_content = "a".repeat(101);
     raw_tx
@@ -194,7 +195,7 @@ async fn gate_drops_too_long_message() {
         other => panic!("expected Drop decision, got {other:?}"),
     }
 
-    // No reply should be generated for a dropped message.
+    // No escalation should be generated for a dropped message.
     let maybe_reply = tokio::time::timeout(Duration::from_millis(200), out_rx.recv()).await;
     assert!(maybe_reply.is_err() || maybe_reply.unwrap().is_none());
 
@@ -209,13 +210,11 @@ async fn gate_escalate_all_heuristic_sends_escalation() {
     let gate = GateActor::new(
         GateConfig {
             max_message_length: 100,
-            max_cozy_words: 10,
-            llm_temperature: 0.7,
-            llm_max_tokens: 32,
+            max_ambient_words: 10,
             concurrency_limit: 2,
             heuristic: "escalate_all".to_string(),
         },
-        MockLlmClient::new(vec![]),
+        bot_identity(),
     );
 
     tokio::spawn(async move {
@@ -234,7 +233,7 @@ async fn gate_escalate_all_heuristic_sends_escalation() {
     assert!(
         matches!(
             event,
-            Event::GateDecision(neko_core::GateDecision::Escalate(_))
+            Event::GateDecision(neko_core::GateDecision::Escalate(_, _))
         ),
         "expected Escalate decision, got {event:?}"
     );
@@ -244,7 +243,7 @@ async fn gate_escalate_all_heuristic_sends_escalation() {
         .expect("timeout waiting for escalation event")
         .expect("output channel closed");
     assert!(
-        matches!(event, Event::Escalation(_, _, _)),
+        matches!(event, Event::Escalation(_, _, _, _)),
         "expected Escalation event, got {event:?}"
     );
 }
@@ -286,6 +285,7 @@ async fn council_replies_directly_when_decision_is_reply() {
             neko_core::EscalationReason::NeedsContext,
             msg,
             state,
+            EngagementType::PersonalReply,
         ))
         .await
         .unwrap();
@@ -349,6 +349,7 @@ async fn council_launches_detective_when_decision_is_detective() {
             neko_core::EscalationReason::NeedsContext,
             msg,
             state,
+            EngagementType::PersonalReply,
         ))
         .await
         .unwrap();
@@ -650,6 +651,7 @@ async fn router_forwards_events_to_downstream_layers() {
         neko_core::EscalationReason::NeedsContext,
         msg,
         AffectiveState::default(),
+        EngagementType::PersonalReply,
     ))
     .await
     .unwrap();
@@ -658,7 +660,7 @@ async fn router_forwards_events_to_downstream_layers() {
             .await
             .expect("timeout waiting for council event")
             .unwrap(),
-        Event::Escalation(_, _, _)
+        Event::Escalation(_, _, _, _)
     ));
 
     dispatch(Event::DetectiveRequest(DetectiveInput {
@@ -872,7 +874,7 @@ async fn full_pipeline_replies_through_router() {
     let (gate_tx, gate_rx) = mpsc::channel(64);
     let (router_tx, router_rx) = mpsc::channel(64);
     let (sensory_routed_tx, sensory_routed_rx) = mpsc::channel(64);
-    let (council_tx, _council_rx) = mpsc::channel(16);
+    let (council_tx, council_rx) = mpsc::channel(16);
     let (detective_tx, _detective_rx) = mpsc::channel(16);
     let (solidify_tx, _solidify_rx) = mpsc::channel(16);
 
@@ -890,20 +892,40 @@ async fn full_pipeline_replies_through_router() {
     let gate = GateActor::new(
         GateConfig {
             max_message_length: 100,
-            max_cozy_words: 10,
-            llm_temperature: 0.7,
-            llm_max_tokens: 32,
+            max_ambient_words: 10,
             concurrency_limit: 2,
             ..Default::default()
         },
-        MockLlmClient::new(vec!["喵~".to_string()]),
+        bot_identity(),
+    );
+
+    let history: Arc<dyn HistoryStore + Send + Sync> = Arc::new(sqlite.clone());
+    let council = neko_council::CouncilActor::new(
+        neko_council::CouncilConfig {
+            context_limit: 5,
+            llm_temperature: 0.9,
+            llm_max_tokens: 128,
+            ..Default::default()
+        },
+        MockLlmClient::new(vec![serde_json::json!({
+            "action": "reply",
+            "reasoning": "打招呼",
+            "draft_reply": "喵~"
+        })
+        .to_string()]),
+        history,
     );
 
     tokio::spawn(async move {
         let _ = sensory.run(raw_rx, sensory_routed_rx, gate_tx).await;
     });
+    let router_tx_for_gate = router_tx.clone();
     tokio::spawn(async move {
-        let _ = gate.run(gate_rx, router_tx).await;
+        let _ = gate.run(gate_rx, router_tx_for_gate).await;
+    });
+    let router_tx_for_council = router_tx.clone();
+    tokio::spawn(async move {
+        let _ = council.run(council_rx, router_tx_for_council).await;
     });
     spawn_dispatcher(
         router_rx,
@@ -921,7 +943,7 @@ async fn full_pipeline_replies_through_router() {
         .await
         .unwrap();
 
-    // The message eventually comes back as a reply via the real router path.
+    // The message eventually comes back as a reply via gate -> router -> council -> router.
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if !egress.sent.lock().await.is_empty() {
@@ -936,12 +958,12 @@ async fn full_pipeline_replies_through_router() {
     let sent = egress.sent.lock().await;
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].content, "喵~");
-    assert_eq!(sent[0].layer, "gate");
+    assert_eq!(sent[0].layer, "council");
     drop(sent);
 
     assert_eq!(sqlite.count_replies().await.unwrap(), 1);
-    // Gate decision is also recorded as an event.
-    assert_eq!(sqlite.count_events().await.unwrap(), 1);
+    // Gate decision and council decision are both recorded as events.
+    assert_eq!(sqlite.count_events().await.unwrap(), 2);
 
     let _ = shutdown_tx.send(true);
 }
@@ -1008,6 +1030,7 @@ async fn detective_feedback_loop_replies_through_router() {
             neko_core::EscalationReason::NeedsContext,
             msg,
             AffectiveState::default(),
+            EngagementType::PersonalReply,
         ),
         egress.as_ref(),
         &sqlite,

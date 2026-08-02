@@ -1,25 +1,28 @@
-use crate::heuristic::{heuristic_from_name, GateHeuristic};
+use crate::heuristic::{heuristic_from_name, BotIdentity, GateClassification, GateHeuristic};
 use dashmap::DashMap;
 use neko_core::{
-    AffectiveState, ChatMessage, DropReason, EscalationReason, Event, FinishReason, GateDecision,
-    GroupId, LlmClient, LlmMessage, LlmRequest, LlmRole, NekoError, ReplyOut, ResponseFormat,
+    AffectiveState, ChatMessage, EngagementType, Event, GateDecision, GroupId, NekoError,
     RuntimeState, UserId,
 };
 use std::sync::Arc;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tracing::{debug, info, info_span, warn, Instrument};
 
 /// Configuration for the gate layer.
 #[derive(Debug, Clone)]
 pub struct GateConfig {
+    /// Messages longer than this are dropped before classification.
     pub max_message_length: usize,
-    pub max_cozy_words: usize,
-    pub llm_temperature: f32,
-    pub llm_max_tokens: u32,
+    /// Word budget for ambient join candidates. The heuristic treats messages
+    /// with at most `max_ambient_words * 3` whitespace-separated tokens as
+    /// potential ambient joins.
+    pub max_ambient_words: usize,
+    /// Maximum concurrent classification tasks.
     pub concurrency_limit: usize,
     /// Name of the heuristic strategy to use. Built-in names:
-    /// - `"default"`: filter commands, URLs, and long messages.
-    /// - `"escalate_all"`: always escalate (testing stub).
+    /// - `"default"`: classify commands/URLs/long messages as drop, directed
+    ///   messages as personal replies, short chitchat as ambient joins.
+    /// - `"escalate_all"`: always escalate as personal reply (testing stub).
     pub heuristic: String,
 }
 
@@ -27,38 +30,41 @@ impl Default for GateConfig {
     fn default() -> Self {
         Self {
             max_message_length: 800,
-            max_cozy_words: 10,
-            llm_temperature: 0.7,
-            llm_max_tokens: 32,
+            max_ambient_words: 10,
             concurrency_limit: 8,
             heuristic: "default".to_string(),
         }
     }
 }
 
-/// Layer 2 actor: cheap-model gate.
-pub struct GateActor<C: LlmClient> {
+/// Layer 2 actor: fast heuristic gate.
+///
+/// The gate no longer generates replies. Its only job is to decide whether the
+/// bot should engage and, if so, whether the message is a personal reply or an
+/// ambient group join. All engagement decisions are escalated to the council.
+pub struct GateActor {
     config: GateConfig,
-    llm: Arc<C>,
-    semaphore: Arc<Semaphore>,
+    self_id: BotIdentity,
     states: DashMap<(GroupId, UserId), AffectiveState>,
     heuristic: Arc<dyn GateHeuristic>,
     /// Optional shared runtime metrics, updated when messages enter the gate.
     state: Option<Arc<RuntimeState>>,
 }
 
-impl<C: LlmClient + 'static> GateActor<C> {
-    pub fn new(config: GateConfig, llm: C) -> Self {
-        Self::new_with_state(config, llm, None)
+impl GateActor {
+    pub fn new(config: GateConfig, self_id: BotIdentity) -> Self {
+        Self::new_with_state(config, self_id, None)
     }
 
-    pub fn new_with_state(config: GateConfig, llm: C, state: Option<Arc<RuntimeState>>) -> Self {
-        let semaphore = Arc::new(Semaphore::new(config.concurrency_limit));
+    pub fn new_with_state(
+        config: GateConfig,
+        self_id: BotIdentity,
+        state: Option<Arc<RuntimeState>>,
+    ) -> Self {
         let heuristic = Arc::from(heuristic_from_name(&config.heuristic));
         Self {
             config,
-            llm: Arc::new(llm),
-            semaphore,
+            self_id,
             states: DashMap::new(),
             heuristic,
             state,
@@ -116,101 +122,42 @@ impl<C: LlmClient + 'static> GateActor<C> {
     ) -> Result<(), NekoError> {
         debug!("gate processing message from {}", msg.sender);
 
-        if msg.char_count() > self.config.max_message_length {
-            out.send(Event::GateDecision(GateDecision::Drop(DropReason::TooLong)))
-                .await
-                .ok();
-            return Ok(());
-        }
+        let classification = self.heuristic.classify(&msg, &self.config, &self.self_id);
 
-        let decision = if self.should_cozy(&msg) {
-            let _permit = self
-                .semaphore
-                .acquire()
-                .await
-                .map_err(|e| NekoError::other(format!("semaphore closed: {e}")))?;
-
-            match self.generate_cozy(&msg).await {
-                Ok(reply) => GateDecision::CozyReply(reply),
-                Err(e) => {
-                    warn!("cozy generation failed: {e}, escalating");
-                    GateDecision::Escalate(EscalationReason::NeedsContext)
-                }
+        let decision = match classification {
+            GateClassification::Drop(reason) => GateDecision::Drop(reason),
+            GateClassification::Escalate(engagement_type) => {
+                GateDecision::Escalate(reason_for(&msg, engagement_type), engagement_type)
             }
-        } else {
-            GateDecision::Escalate(EscalationReason::NeedsContext)
         };
 
         out.send(Event::GateDecision(decision.clone())).await.ok();
 
-        if let GateDecision::CozyReply(reply) = decision {
-            out.send(Event::ReplyOut(ReplyOut {
-                id: uuid::Uuid::new_v4(),
-                reply_to: msg.id,
-                reply_to_platform: None,
-                group_id: msg.group_id.clone(),
-                target_user: msg.sender.clone(),
-                content: reply,
-                layer: "gate".to_string(),
-                trace_id: msg.trace_id,
-            }))
-            .await
-            .map_err(|_| NekoError::transport("router channel closed"))?;
-        } else if let GateDecision::Escalate(reason) = decision {
-            out.send(Event::Escalation(reason, msg, state))
-                .await
-                .map_err(|_| NekoError::transport("router channel closed"))?;
+        match decision {
+            GateDecision::Drop(_) => {
+                // Nothing further to do.
+            }
+            GateDecision::Escalate(reason, engagement_type) => {
+                out.send(Event::Escalation(reason, msg, state, engagement_type))
+                    .await
+                    .map_err(|_| NekoError::transport("router channel closed"))?;
+            }
         }
 
         Ok(())
     }
-
-    /// Heuristic that decides whether a message can be handled by the cheap
-    /// cozy path. Delegates to the configured [`GateHeuristic`].
-    fn should_cozy(&self, msg: &ChatMessage) -> bool {
-        self.heuristic.should_cozy(msg, &self.config)
-    }
-
-    async fn generate_cozy(&self, msg: &ChatMessage) -> Result<String, NekoError> {
-        let prompt = crate::prompt::cozy_prompt(&msg.content, self.config.max_cozy_words);
-        let req = LlmRequest {
-            messages: vec![LlmMessage {
-                role: LlmRole::User,
-                content: prompt,
-            }],
-            temperature: self.config.llm_temperature,
-            max_tokens: Some(self.config.llm_max_tokens),
-            response_format: Some(ResponseFormat::Text),
-        };
-
-        let resp = self.llm.complete(req).await?;
-        let mut text = resp.content.trim().to_string();
-
-        // Strip surrounding quotes if the model added them.
-        if text.starts_with('"') && text.ends_with('"') && text.len() >= 2 {
-            text = text[1..text.len() - 1].to_string();
-        }
-
-        // Hard truncate to the word budget.
-        let words: Vec<&str> = text.split_whitespace().collect();
-        if words.len() > self.config.max_cozy_words {
-            text = words[..self.config.max_cozy_words].join("");
-        }
-
-        if matches!(resp.finish_reason, FinishReason::Length) {
-            warn!("cozy reply hit max_tokens");
-        }
-
-        Ok(text)
-    }
 }
 
-impl<C: LlmClient> Clone for GateActor<C> {
+/// Map an engagement classification to a human-readable escalation reason.
+fn reason_for(_msg: &ChatMessage, _engagement_type: EngagementType) -> neko_core::EscalationReason {
+    neko_core::EscalationReason::NeedsContext
+}
+
+impl Clone for GateActor {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            llm: self.llm.clone(),
-            semaphore: self.semaphore.clone(),
+            self_id: self.self_id.clone(),
             states: self.states.clone(),
             heuristic: self.heuristic.clone(),
             state: self.state.clone(),

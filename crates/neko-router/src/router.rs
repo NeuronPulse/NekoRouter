@@ -88,7 +88,7 @@ pub async fn dispatch_event_with_state(
                 .insert_event(uuid::Uuid::new_v4(), "gate_decision", &payload, Utc::now())
                 .await?;
         }
-        Event::Escalation(_, _, _) => {
+        Event::Escalation(_, _, _, _) => {
             council_tx
                 .send(event)
                 .await

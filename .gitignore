@@ -5,3 +5,5 @@ config/production.toml
 .env
 *.db
 .trae/
+/napcat-data
+/napcat-config

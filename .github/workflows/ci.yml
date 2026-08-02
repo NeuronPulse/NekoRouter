@@ -17,5 +17,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Pull and start Docker services
+        run: |
+          docker compose -f docker-compose.dev.yml pull
+          docker compose -f docker-compose.dev.yml up -d --wait
       - name: Run test suite
         run: ./scripts/test.sh

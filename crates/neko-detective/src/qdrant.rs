@@ -94,7 +94,7 @@ impl VectorStore for QdrantVectorStore {
 
         let points: Vec<PointStruct> = records
             .iter()
-            .zip(embeddings.into_iter())
+            .zip(embeddings)
             .map(|(record, vector)| {
                 let payload = Self::record_to_payload(record)?;
                 Ok(PointStruct::new(record.id.clone(), vector, payload))

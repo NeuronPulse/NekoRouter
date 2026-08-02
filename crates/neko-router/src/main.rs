@@ -3,12 +3,12 @@ use neko_core::{
     CooldownStore, Egress, Event, GraphStore, HistoryStore, Ingress, NekoError, ResponseFormat,
     RuntimeState, VectorStore,
 };
-use neko_detective::{DetectiveActor, DetectiveConfig, InMemoryVectorStore, QdrantVectorStore};
+use neko_detective::{DetectiveActor, DetectiveConfig, QdrantVectorStore};
 use neko_gate::{BotIdentity, GateActor, GateConfig};
 use neko_llm::{OpenAiCompatibleClient, OpenAiEmbeddingClient};
 use neko_memory::SqliteStore;
 use neko_sensory::{NapCatEgress, NapCatIngress, SensoryActor, SensoryConfig};
-use neko_solidify::{InMemoryGraphStore, Neo4jGraphStore, SolidifyActor, SolidifyConfig};
+use neko_solidify::{Neo4jGraphStore, SolidifyActor, SolidifyConfig};
 use secrecy::ExposeSecret;
 use std::sync::Arc;
 use std::time::Duration;
@@ -383,11 +383,6 @@ async fn build_vector_store(
     qdrant: &neko_config::QdrantConfig,
     embedding: &neko_config::EmbeddingConfig,
 ) -> Result<Arc<dyn VectorStore + Send + Sync>, NekoError> {
-    if qdrant.url.is_empty() {
-        info!("qdrant.url is empty, using in-memory vector store");
-        return Ok(Arc::new(InMemoryVectorStore::new()));
-    }
-
     info!("connecting to Qdrant at {}", qdrant.url);
     let embedding_client = OpenAiEmbeddingClient::new(
         "embedding",
@@ -409,11 +404,6 @@ async fn build_vector_store(
 async fn build_graph_store(
     config: &Neo4jConfig,
 ) -> Result<Arc<dyn GraphStore + Send + Sync>, NekoError> {
-    if config.uri.is_empty() {
-        info!("neo4j.uri is empty, using in-memory graph store");
-        return Ok(Arc::new(InMemoryGraphStore::new()));
-    }
-
     info!("connecting to Neo4j at {}", config.uri);
     let store =
         Neo4jGraphStore::new(&config.uri, &config.user, config.password.expose_secret()).await?;

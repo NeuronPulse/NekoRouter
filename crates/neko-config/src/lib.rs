@@ -304,22 +304,27 @@ impl NekoConfig {
         self.detective_provider()?;
         self.solidify_provider()?;
 
-        if !self.qdrant.url.is_empty() {
-            if self.embedding.base_url.is_empty() {
-                return Err(NekoError::config(
-                    "embedding.base_url is required when qdrant is enabled",
-                ));
-            }
-            if self.embedding.model.is_empty() {
-                return Err(NekoError::config(
-                    "embedding.model is required when qdrant is enabled",
-                ));
-            }
-            if self.embedding.api_key.expose_secret().is_empty() {
-                return Err(NekoError::config(
-                    "embedding.api_key is required when qdrant is enabled",
-                ));
-            }
+        if self.qdrant.url.is_empty() {
+            return Err(NekoError::config("qdrant.url is required"));
+        }
+        if self.embedding.base_url.is_empty() {
+            return Err(NekoError::config("embedding.base_url is required"));
+        }
+        if self.embedding.model.is_empty() {
+            return Err(NekoError::config("embedding.model is required"));
+        }
+        if self.embedding.api_key.expose_secret().is_empty() {
+            return Err(NekoError::config("embedding.api_key is required"));
+        }
+
+        if self.neo4j.uri.is_empty() {
+            return Err(NekoError::config("neo4j.uri is required"));
+        }
+        if self.neo4j.user.is_empty() {
+            return Err(NekoError::config("neo4j.user is required"));
+        }
+        if self.neo4j.password.expose_secret().is_empty() {
+            return Err(NekoError::config("neo4j.password is required"));
         }
 
         for (name, provider) in &self.llm.providers {

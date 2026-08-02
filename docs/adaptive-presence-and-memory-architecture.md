@@ -16,7 +16,7 @@
 - **LLM 优先于硬编码**：参与时机、记忆归类、关系变化尽量交给模型判断；代码只负责“结构化输入 / 解析输出 / 分发存储”。
 - **事件驱动、通道解耦**：每一层都是 actor，通过 `tokio::sync::mpsc` 收发 `Event`。
 - **新增事件必须在 router 注册**：`crates/neko-router/src/router.rs` 的 `dispatch_event_full` 是中央路由；新的 layer/event 必须在这里加 match arm。
-- **降级友好**：Qdrant/Neo4j 未配置时自动使用 `InMemoryVectorStore` / `InMemoryGraphStore`，不需要外部服务也能跑测试。
+- **外部存储必须配置**：生产环境强制连接 Qdrant 与 Neo4j，启动时 `qdrant.url` / `neo4j.uri` 为空会直接报错；单元测试仍使用内存实现作为 mock。
 - **状态可持久化**：情感状态、回复冷却水线都落到 SQLite，重启不丢。
 
 ## 3. 总体架构
